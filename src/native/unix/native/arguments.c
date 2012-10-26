@@ -20,7 +20,7 @@
 #include <glob.h>
 
 /* Return the argument of a command line option */
-static char *optional(int argc, char *argv[], int argi)
+static char *optional(int argc, const char *argv[], int argi)
 {
 
     argi++;
@@ -142,11 +142,11 @@ static char* eval_cpath(const char *cp)
 }
 
 /* Parse command line arguments */
-static arg_data *parse(int argc, char *argv[])
+static arg_data *parse(int argc, const char *argv[])
 {
     arg_data *args = NULL;
     char *temp     = NULL;
-    char *cmnd     = NULL;
+    const char *cmnd     = NULL;
     int x          = 0;
 
     /* Create the default command line arguments */
@@ -434,7 +434,7 @@ static const char *IsEnabledDisabled(bool par)
 }
 
 /* Main entry point: parse command line arguments and dump them */
-arg_data *arguments(int argc, char *argv[])
+arg_data *arguments(int argc, const char *argv[])
 {
     arg_data *args = parse(argc,argv);
     int x = 0;

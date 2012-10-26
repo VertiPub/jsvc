@@ -20,7 +20,7 @@
 #include <unistd.h>
 #include <time.h>
 
-/* Wether debug is enabled or not */
+/* Whether debug is enabled or not */
 bool log_debug_flag = false;
 
 /* Wether SYSLOG logging (for stderr) is enable or not. */

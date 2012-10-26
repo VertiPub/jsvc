@@ -69,7 +69,7 @@ static void java_abort123(void)
     exit(123);
 }
 
-char *java_library(arg_data *args, home_data *data)
+char *java_library(const arg_data *args, const home_data *data)
 {
     char *libf = NULL;
 
@@ -131,7 +131,7 @@ bool java_signal(void)
 }
 
 /* Initialize the JVM and its environment, loading libraries and all */
-bool java_init(arg_data *args, home_data *data)
+bool java_init(const arg_data *args, const home_data *data)
 {
 #ifdef OS_DARWIN
     dso_handle apph = NULL;
@@ -378,7 +378,7 @@ bool JVM_destroy(int exit)
 }
 
 /* Call the load method in our DaemonLoader class */
-bool java_load(arg_data *args)
+bool java_load(const arg_data *args)
 {
     jclass stringClass       = NULL;
     jstring className        = NULL;
@@ -544,7 +544,7 @@ bool java_version(void)
 }
 
 /* Call the check method in our DaemonLoader class */
-bool java_check(arg_data *args)
+bool java_check(const arg_data *args)
 {
     jstring className = NULL;
     jmethodID method = NULL;

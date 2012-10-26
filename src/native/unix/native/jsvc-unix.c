@@ -27,7 +27,6 @@
 #include <string.h>
 #include <pwd.h>
 #include <grp.h>
-#include <syslog.h>
 #include <errno.h>
 #ifdef OS_LINUX
 #include <sys/prctl.h>
@@ -39,1069 +38,754 @@
 #endif
 #endif
 #include <time.h>
+#include <semaphore.h>
+#include <limits.h>
 
-#ifdef OS_CYGWIN
-#include <sys/fcntl.h>
-#define F_ULOCK 0               /* Unlock a previously locked region */
-#define F_LOCK  1               /* Lock a region for exclusive use */
-#endif
-extern char **environ;
-
-static mode_t envmask;          /* mask to create the files */
-
-pid_t controlled = 0;           /* the child process pid */
-pid_t logger_pid = 0;           /* the logger process pid */
-static bool stopping = false;
-static bool doreload = false;
-static bool doreopen = false;
-static bool dosignal = false;
-typedef void (*sighandler_t)(int);
-static sighandler_t handler_int  = NULL;
-static sighandler_t handler_usr1 = NULL;
-static sighandler_t handler_usr2 = NULL;
-static sighandler_t handler_hup  = NULL;
-static sighandler_t handler_trm  = NULL;
-
-static int run_controller(arg_data *args, home_data *data, uid_t uid,
-                          gid_t gid);
-static void set_output(char *outfile, char *errfile, bool redirectstdin,
-                       char *procname);
-
-#ifdef OS_CYGWIN
-/*
- * File locking routine
- */
-static int lockf(int fildes, int function, off_t size)
-{
-    struct flock buf;
-
-    switch (function) {
-    case F_LOCK:
-        buf.l_type = F_WRLCK;
-        break;
-    case F_ULOCK:
-        buf.l_type = F_UNLCK;
-        break;
-    default:
-        return -1;
-    }
-    buf.l_whence = 0;
-    buf.l_start = 0;
-    buf.l_len = size;
-
-    return fcntl(fildes, F_SETLK, &buf);
-}
-
-#endif
-
-static void handler(int sig)
-{
-    switch (sig) {
-        case SIGTERM:
-            log_debug("Caught SIGTERM: Scheduling a shutdown");
-            if (stopping == true) {
-                log_error("Shutdown or reload already scheduled");
-            }
-            else {
-                stopping = true;
-            }
-        break;
-        case SIGINT:
-            log_debug("Caught SIGINT: Scheduling a shutdown");
-            if (stopping == true) {
-                log_error("Shutdown or reload already scheduled");
-            }
-            else {
-                stopping = true;
-            }
-        break;
-        case SIGHUP:
-            log_debug("Caught SIGHUP: Scheduling a reload");
-            if (stopping == true) {
-                log_error("Shutdown or reload already scheduled");
-            }
-            else {
-                stopping = true;
-                doreload = true;
-            }
-        break;
-        case SIGUSR1:
-             log_debug("Caught SIGUSR1: Reopening logs");
-             doreopen = true;
-	break;
-        case SIGUSR2:
-	     log_debug("Caught SIGUSR2: Scheduling a custom signal");
-             dosignal = true;
-        break;
-        default:
-            log_debug("Caught unknown signal %d", sig);
-        break;
-    }
-}
-
-/* user and group */
-static int set_user_group(const char *user, int uid, int gid)
-{
-    if (user != NULL) {
-        if (setgid(gid) != 0) {
-            log_error("Cannot set group id for user '%s'", user);
-            return -1;
-        }
-        if (initgroups(user, gid) != 0) {
-            if (getuid() != uid) {
-                log_error("Cannot set supplement group list for user '%s'",
-                          user);
-                return -1;
-            }
-            else
-                log_debug("Cannot set supplement group list for user '%s'",
-                          user);
-        }
-        if (getuid() == uid) {
-            log_debug("No need to change user to '%s'!", user);
-            return 0;
-        }
-        if (setuid(uid) != 0) {
-            log_error("Cannot set user id for user '%s'", user);
-            return -1;
-        }
-        log_debug("user changed to '%s'", user);
-    }
-    return 0;
-}
-
-/* Set linux capability, user and group */
-#ifdef OS_LINUX
-/* CAPSALL is to allow to read/write at any location */
-#define LEGACY_CAPSALL  (1 << CAP_NET_BIND_SERVICE) +   \
-                        (1 << CAP_SETUID) +             \
-                        (1 << CAP_SETGID) +             \
-                        (1 << CAP_DAC_READ_SEARCH) +    \
-                        (1 << CAP_DAC_OVERRIDE)
-
-#define LEGACY_CAPSMAX  (1 << CAP_NET_BIND_SERVICE) +   \
-                        (1 << CAP_DAC_READ_SEARCH) +    \
-                        (1 << CAP_DAC_OVERRIDE)
-
-/* That a more reasonable configuration */
-#define LEGACY_CAPS     (1 << CAP_NET_BIND_SERVICE) +   \
-                        (1 << CAP_DAC_READ_SEARCH) +    \
-                        (1 << CAP_SETUID) +             \
-                        (1 << CAP_SETGID)
-
-/* probably the only one Java could use */
-#define LEGACY_CAPSMIN  (1 << CAP_NET_BIND_SERVICE) +   \
-                        (1 << CAP_DAC_READ_SEARCH)
-
-#define LEGACY_CAP_VERSION  0x19980330
-static int set_legacy_caps(int caps)
-{
-    struct __user_cap_header_struct caphead;
-    struct __user_cap_data_struct   cap;
-
-    memset(&caphead, 0, sizeof caphead);
-    caphead.version = LEGACY_CAP_VERSION;
-    caphead.pid = 0;
-    memset(&cap, 0, sizeof cap);
-    cap.effective = caps;
-    cap.permitted = caps;
-    cap.inheritable = caps;
-    if (syscall(__NR_capset, &caphead, &cap) < 0) {
-        log_error("set_caps: failed to set capabilities");
-        log_error("check that your kernel supports capabilities");
-        return -1;
-    }
-    return 0;
-}
-
-#ifdef HAVE_LIBCAP
-static cap_value_t caps_std[] = {
-    CAP_NET_BIND_SERVICE,
-    CAP_SETUID,
-    CAP_SETGID,
-    CAP_DAC_READ_SEARCH
-};
-
-static cap_value_t caps_min[] = {
-    CAP_NET_BIND_SERVICE,
-    CAP_DAC_READ_SEARCH
-};
-
-#define CAPS     1
-#define CAPSMIN  2
-
-
-typedef int     (*fd_cap_free)(void *);
-typedef cap_t   (*fd_cap_init)(void);
-typedef int     (*fd_cap_clear)(cap_t);
-typedef int     (*fd_cap_get_flag)(cap_t, cap_value_t, cap_flag_t, cap_flag_value_t *);
-typedef int     (*fd_cap_set_flag)(cap_t, cap_flag_t, int, const cap_value_t *, cap_flag_value_t);
-typedef int     (*fd_cap_set_proc)(cap_t);
-
-static dso_handle hlibcap = NULL;
-static fd_cap_free  fp_cap_free;
-static fd_cap_init  fp_cap_init;
-static fd_cap_clear fp_cap_clear;
-static fd_cap_get_flag fp_cap_get_flag;
-static fd_cap_set_flag fp_cap_set_flag;
-static fd_cap_set_proc fp_cap_set_proc;
-
-static const char *libcap_locs[] = {
-    "/lib/libcap.so.2",
-    "/lib/libcap.so.1",
-    "/lib/libcap.so",
-    "/usr/lib/libcap.so.2",
-    "/usr/lib/libcap.so.1",
-    "/usr/lib/libcap.so",
-    NULL
-};
-
-static int ld_libcap(void)
-{
-    int i = 0;
-    dso_handle dso = NULL;
-#define CAP_LDD(name) \
-    if ((fp_##name = dso_symbol(dso, #name)) == NULL) { \
-        log_error("cannot locate " #name " in libcap.so -- %s", dso_error());  \
-        dso_unlink(dso);    \
-        return -1;          \
-    } else log_debug("loaded " #name " from libcap.")
-
-    if (hlibcap != NULL)
-        return 0;
-    while (libcap_locs[i] && dso == NULL) {
-        if ((dso = dso_link(libcap_locs[i++])))
-            break;
-    };
-    if (dso == NULL) {
-        log_error("failed loading capabilities library -- %s.", dso_error());
-        return -1;
-    }
-    CAP_LDD(cap_free);
-    CAP_LDD(cap_init);
-    CAP_LDD(cap_clear);
-
-    CAP_LDD(cap_get_flag);
-    CAP_LDD(cap_set_flag);
-    CAP_LDD(cap_set_proc);
-    hlibcap = dso;
-#undef CAP_LDD
-    return 0;
-}
-
-
-static int set_caps(int cap_type)
-{
-    cap_t c;
-    int ncap;
-    int flag = CAP_SET;
-    cap_value_t *caps;
-    const char  *type;
-
-    if (ld_libcap()) {
-        return set_legacy_caps(cap_type);
-    }
-    if (cap_type == CAPS) {
-        ncap = sizeof(caps_std)/sizeof(cap_value_t);
-        caps = caps_std;
-        type = "default";
-    }
-    else if (cap_type == CAPSMIN) {
-        ncap = sizeof(caps_min)/sizeof(cap_value_t);
-        caps = caps_min;
-        type = "min";
-    }
-    else {
-        ncap = sizeof(caps_min)/sizeof(cap_value_t);
-        caps = caps_min;
-        type = "null";
-        flag = CAP_CLEAR;
-    }
-    c = (*fp_cap_init)();
-    (*fp_cap_clear)(c);
-    (*fp_cap_set_flag)(c, CAP_EFFECTIVE,   ncap, caps, flag);
-    (*fp_cap_set_flag)(c, CAP_INHERITABLE, ncap, caps, flag);
-    (*fp_cap_set_flag)(c, CAP_PERMITTED,   ncap, caps, flag);
-    if ((*fp_cap_set_proc)(c) != 0) {
-        log_error("failed setting %s capabilities.", type);
-        return -1;
-    }
-    (*fp_cap_free)(c);
-    if (cap_type == CAPS)
-        log_debug("increased capability set.");
-    else if (cap_type == CAPSMIN)
-        log_debug("decreased capability set to min required.");
-    else
-        log_debug("dropped capabilities.");
-    return 0;
-}
-
-#else /* !HAVE_LIBCAP */
-/* CAPSALL is to allow to read/write at any location */
-#define CAPSALL LEGACY_CAPSALL
-#define CAPSMAX LEGACY_CAPSMAX
-#define CAPS    LEGACY_CAPS
-#define CAPSMIN LEGACY_CAPSMIN
-static int set_caps(int caps)
-{
-    return set_legacy_caps(caps);
-}
-#endif
-
-static int linuxset_user_group(const char *user, int uid, int gid)
-{
-    int caps_set = 0;
-
-    if (user == NULL)
-        return 0;
-    /* set capabilities enough for binding port 80 setuid/getuid */
-    if (getuid() == 0) {
-        if (set_caps(CAPS) != 0) {
-            if (getuid() != uid) {
-                log_error("set_caps(CAPS) failed for user '%s'", user);
-                return -1;
-            }
-            log_debug("set_caps(CAPS) failed for user '%s'", user);
-        }
-        /* make sure they are kept after setuid */
-        if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0) {
-            log_error("prctl failed in for user '%s'", user);
-            return -1;
-        }
-        caps_set = 1;
-    }
-
-    /* set setuid/getuid */
-    if (set_user_group(user, uid, gid) != 0) {
-        log_error("set_user_group failed for user '%s'", user);
-        return -1;
-    }
-
-    if (caps_set) {
-        /* set capability to binding port 80 read conf */
-        if (set_caps(CAPSMIN) != 0) {
-            if (getuid() != uid) {
-                log_error("set_caps(CAPSMIN) failed for user '%s'", user);
-                return -1;
-            }
-            log_debug("set_caps(CAPSMIN) failed for user '%s'", user);
-        }
-    }
-
-    return 0;
-}
-#endif
-
-
-static bool checkuser(char *user, uid_t * uid, gid_t * gid)
-{
-    struct passwd *pwds = NULL;
-    int status = 0;
-    pid_t pid  = 0;
-
-    /* Do we actually _have_ to switch user? */
-    if (user == NULL)
-        return true;
-
-    pwds = getpwnam(user);
-    if (pwds == NULL) {
-        log_error("Invalid user name '%s' specified", user);
-        return false;
-    }
-
-    *uid = pwds->pw_uid;
-    *gid = pwds->pw_gid;
-
-    /* Validate the user name in another process */
-    pid = fork();
-    if (pid == -1) {
-        log_error("Cannot validate user name");
-        return false;
-    }
-
-    /* If we're in the child process, let's validate */
-    if (pid == 0) {
-        if (set_user_group(user, *uid, *gid) != 0)
-            exit(1);
-        /* If we got here we switched user/group */
-        exit(0);
-    }
-
-    while (waitpid(pid, &status, 0) != pid) {
-        /* Just wait */
-    }
-
-    /* The child must have exited cleanly */
-    if (WIFEXITED(status)) {
-        status = WEXITSTATUS(status);
-
-        /* If the child got out with 0 the user is ok */
-        if (status == 0) {
-            log_debug("User '%s' validated", user);
-            return true;
-        }
-    }
-
-    log_error("Error validating user '%s'", user);
-    return false;
-}
-
-#ifdef OS_CYGWIN
-static void cygwincontroller(void)
-{
-    raise(SIGTERM);
-}
-#endif
-static void controller(int sig)
-{
-    switch (sig) {
-        case SIGTERM:
-        case SIGINT:
-        case SIGHUP:
-        case SIGUSR1:
-        case SIGUSR2:
-            log_debug("Forwarding signal %d to process %d", sig, controlled);
-            kill(controlled, sig);
-            signal(sig, controller);
-        break;
-        default:
-            log_debug("Caught unknown signal %d", sig);
-        break;
-    }
-}
-
-/*
- * Return the address of the current signal handler and set the new one.
- */
-static sighandler_t signal_set(int sig, sighandler_t newHandler)
-{
-    sighandler_t hand;
-
-    hand = signal(sig, newHandler);
-#ifdef SIG_ERR
-    if (hand == SIG_ERR)
-        hand = NULL;
-#endif
-    if (hand == handler || hand == controller)
-        hand = NULL;
-    return hand;
-}
-
-/*
- * Check pid and if still running
+/* This code does the following... 
+ *
+ * 1. main() initializes and validates.  Specifically:
+ *    a. parses command-line args
+ *    b. if user is specified, tests switching to that user in a separate proc.
+ *    c. reads jvm info based on value of JAVA_HOME env var
+ * 
+ * 2. Call controller_main()
+ *    a. if detach is specified (defaults to true), runs the controller in a
+ *       background process.   Otherwise controller_main() is called in the
+ *       original process.
+ *    b. writes it's own pid to an external pid file
+ *    c. installs signal handlers that will forward signals it catches to the
+ *       jvm process
+ *    d. the controller forks a new process for the jvm.  that process calls
+ *       jvm_main().
+ *    e. monitors the jvm process, restarting it if it is killed by a signal
+ *       other than one it forwarded.
+ * 
+ * 3. The jvm process calls jvm_main()
+ *    a. creates a new jvm using jni
+ *    b. calls the org.apache.commons.daemon.Daemon.init() method via JNI as the
+ *       main user (probably root).   Daemon implementations can bind to 
+ *       privileged ports, etc.
+ *    c. if user is specified in the command-line args, calls drop_privileges() 
+ *       to switch to the user.
+ *    d. calls the org.apache.commons.daemon.Daemon.start() method via JNI.
+ *       Daemon implementations can start processing requests now that they
+ *       are no longer running as root.
+ *    e. runs until either a signal instructs it to exit or the jvm exits.
  */
 
-static int check_pid(arg_data *args)
-{
-    int fd;
-    FILE *pidf;
-    char buff[80];
-    pid_t pidn = getpid();
-    int i, pid;
+/* Try restarting a jvm no more than once every x seconds. */
+static time_t COOLDOWN_SEC = 60;
 
-    fd = open(args->pidf, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-    if (fd < 0) {
-        log_error("Cannot open PID file %s, PID is %d", args->pidf, pidn);
-        return -1;
-    }
-    else {
-        lockf(fd, F_LOCK, 0);
-        i = read(fd, buff, sizeof(buff));
-        if (i > 0) {
-            buff[i] = '\0';
-            pid = atoi(buff);
-            if (kill(pid, 0) == 0) {
-                log_error("Still running according to PID file %s, PID is %d",
-                          args->pidf, pid);
-                lockf(fd, F_ULOCK, 0);
-                close(fd);
-                return 122;
-            }
-        }
-
-        /* skip writing the pid file if version or check */
-        if (args->vers != true && args->chck != true) {
-            lseek(fd, SEEK_SET, 0);
-            pidf = fdopen(fd, "r+");
-            fprintf(pidf, "%d\n", (int)getpid());
-            fflush(pidf);
-            lockf(fd, F_ULOCK, 0);
-            fclose(pidf);
-            close(fd);
-        }
-        else {
-            lockf(fd, F_ULOCK, 0);
-            close(fd);
-        }
-    }
-    return 0;
-}
-
-/*
- * read the pid from the pidfile
+/* absolute path to cronolog file without extension myst be passed on the 
+ * command line.   Examples:
+ * 
+ * /var/log/mydaemon_stderr
+ * /var/log/mydaemon_stdout
+ * /var/log/mydaemon (for combined stderr/stdout)
+ * 
+ * With this format cronolog will rotate daily and always maintain a date-less
+ * symbolic link to the current file. 
  */
-static int get_pidf(arg_data *args, bool quiet)
-{
-    int fd;
-    int i;
-    char buff[80];
+static const char * const CRONO_FMT =
+        "cronolog -x %s-%%Y-%%m-%%d.log -S %s.log";
 
-    fd = open(args->pidf, O_RDONLY, 0);
-    if (!quiet)
-        log_debug("get_pidf: %d in %s", fd, args->pidf);
-    if (fd < 0) {
-        /* something has gone wrong the JVM has stopped */
-        return -1;
-    }
-    lockf(fd, F_LOCK, 0);
-    i = read(fd, buff, sizeof(buff));
-    lockf(fd, F_ULOCK, 0);
-    close(fd);
-    if (i > 0) {
-        buff[i] = '\0';
-        i = atoi(buff);
-        if (!quiet)
-            log_debug("get_pidf: pid %d", i);
-        if (kill(i, 0) == 0)
-            return i;
-    }
-    return -1;
-}
+/* If the JVM exits with exit code 123, the controller will recreate it. */
+static const int RELOAD_EXIT_CODE = 123;
 
-/*
- * Check temporatory file created by controller
- * /tmp/pid.jsvc_up
- * Notes:
- * we fork several times
- * 1 - to be a daemon before the setsid(), the child is the controler process.
- * 2 - to start the JVM in the child process. (whose pid is stored in pidfile).
+/* Max wait for stop */
+static const int STOP_TIMEOUT_SEC = 60;
+
+/* The following variables are volatile and global to the compilation unit
+ * because they are shared with signal handlers
  */
-static int check_tmp_file(arg_data *args)
-{
-    int pid;
-    char buff[80];
-    int fd;
+static volatile int controller_is_running = 1;
+static volatile pid_t jvm_pid = -1;
+static volatile int reload_jvm = 0;
+static sem_t jvm_is_running;
 
-    pid = get_pidf(args, false);
-    if (pid < 0)
-        return -1;
-    sprintf(buff, "/tmp/%d.jsvc_up", pid);
-    log_debug("check_tmp_file: %s", buff);
-    fd = open(buff, O_RDONLY);
-    if (fd == -1)
-        return -1;
-    close(fd);
-    return 0;
-}
+static int controller_main(
+        const arg_data *args,
+        const struct home_data *jvm_info,
+        const struct passwd *user,
+        sem_t *sem);
 
-static void create_tmp_file(arg_data *args)
-{
-    char buff[80];
-    int fd;
+static int jvm_main(
+        const arg_data *args,
+        const struct home_data *jvm_info,
+        const struct passwd *user);
 
-    sprintf(buff, "/tmp/%d.jsvc_up", (int)getpid());
-    log_debug("create_tmp_file: %s", buff);
-    fd = open(buff, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-    if (fd != -1)
-        close(fd);
-}
+static void controller_signal_handler(int signo);
 
-static void remove_tmp_file(arg_data *args)
-{
-    char buff[80];
+static int install_controller_signal_handler(void);
 
-    sprintf(buff, "/tmp/%d.jsvc_up", (int)getpid());
-    log_debug("remove_tmp_file: %s", buff);
-    unlink(buff);
-}
+static int install_jvm_signal_handler(void);
 
-/*
- * wait until jsvc create the I am ready file
- * pid is the controller and args->pidf the JVM itself.
- */
-static int wait_child(arg_data *args, int pid)
-{
-    int count = 10;
-    bool havejvm = false;
-    int fd;
-    char buff[80];
-    int i, status, waittime;
+static void jvm_signal_handler(int signo);
 
-    log_debug("wait_child %d", pid);
-    waittime = args->wait / 10;
-    if (waittime > 10) {
-        count = waittime;
-        waittime = 10;
-    }
-    while (count > 0) {
-        sleep(1);
-        /* check if the controler is still running */
-        if (waitpid(pid, &status, WNOHANG) == pid) {
-            if (WIFEXITED(status))
-                return (WEXITSTATUS(status));
-            else
-                return 1;
-        }
+typedef enum {
+    SUCCESS = 0,
+    NO_FILE = 1,
+    ERROR = 2
+} read_pid_status;
 
-        /* check if the pid file process exists */
-        fd = open(args->pidf, O_RDONLY);
-        if (fd < 0 && havejvm) {
-            /* something has gone wrong the JVM has stopped */
-            return 1;
-        }
-        lockf(fd, F_LOCK, 0);
-        i = read(fd, buff, sizeof(buff));
-        lockf(fd, F_ULOCK, 0);
-        close(fd);
-        if (i > 0) {
-            buff[i] = '\0';
-            i = atoi(buff);
-            if (kill(i, 0) == 0) {
-                /* the JVM process has started */
-                havejvm = true;
-                if (check_tmp_file(args) == 0) {
-                    /* the JVM is started */
-                    if (waitpid(pid, &status, WNOHANG) == pid) {
-                        if (WIFEXITED(status))
-                            return (WEXITSTATUS(status));
-                        else
-                            return 1;
-                    }
-                    return 0; /* ready JVM started */
-                }
-            }
-        }
-        sleep(waittime);
-        count--;
-    }
-    /* It takes more than the wait time to start,
-     * something must be wrong
-     */
-    return 1;
-}
+static read_pid_status read_controller_pid_file(
+        const arg_data *args,
+        pid_t *controller_pid);
 
-/*
- * stop the running jsvc
- */
-static int stop_child(arg_data *args)
-{
-    int pid = get_pidf(args, false);
-    int count = 60;
+static int write_controller_pid_file(
+        const arg_data *args,
+        pid_t controller_pid);
 
-    if (pid > 0) {
-        /* kill the process and wait until the pidfile has been
-         * removed by the controler
-         */
-        kill(pid, SIGTERM);
-        while (count > 0) {
-            sleep(1);
-            pid = get_pidf(args, true);
-            if (pid <= 0) {
-                /* JVM has stopped */
-                return 0;
-            }
-            count--;
-        }
-    }
-    return -1;
-}
+static int delete_controller_pid_file(const arg_data *args);
 
-/*
- * child process logic.
- */
+static int read_and_validate_user(const char *username, struct passwd *user);
 
-static int child(arg_data *args, home_data *data, uid_t uid, gid_t gid)
-{
-    int ret = 0;
+static int redirect_stdout_stderr(
+        const arg_data *args,
+        FILE **crono_err,
+        FILE **crono_out);
 
-    /* check the pid file */
-    ret = check_pid(args);
-    if (args->vers != true && args->chck != true) {
-        if (ret == 122)
-            return ret;
-        if (ret < 0)
-            return ret;
-    }
+static void close_stdout_stderr(FILE *crono_err, FILE *crono_out);
 
-#ifdef OS_LINUX
-    /* setuid()/setgid() only apply the current thread so we must do it now */
-    if (linuxset_user_group(args->user, uid, gid) != 0)
-        return 4;
-#endif
-    /* Initialize the Java VM */
-    if (java_init(args, data) != true) {
-        log_debug("java_init failed");
+static int drop_privileges(const struct passwd *user);
+
+static int stop_controller(const arg_data *args);
+
+static int print_java_version(
+        const arg_data *args,
+        const struct home_data *jvm_info);
+
+static int linux_replace_process_image(
+        const arg_data *args,
+        const struct home_data *jvm_info,
+        int argc,
+        const char **argv);
+
+static const char *select_jvm(
+        const struct home_data *jvm_info,
+        const char *jvm_name);
+
+typedef enum {
+    SUCCESS_EXIT = 0,
+    ERROR_EXIT = 1,
+    SIGNAL_EXIT = 2,
+    INTERNAL_ERROR = 3,
+    INTERRUPTED = 4,
+    CHILD_GONE = 5
+} child_status;
+
+static child_status wait_for_child(
+        const char *parent_name,
+        const char *child_name,
+        pid_t child_pid,
+        int *exit_code,
+        int *signo,
+        int wait_options);
+
+int main(int argc, const char **argv) {
+    arg_data *args = NULL;
+    struct passwd user;
+    struct home_data *jvm_info = NULL;
+    pid_t controller_pid = 0;
+    char sem_name[NAME_MAX - 4]; /* NAME_MAX - 4 from manpage */
+    sem_t *sem = NULL;
+    int result = 0;
+
+    memset(&user, 0, sizeof (user));
+
+    args = arguments(argc, argv);
+
+    if (!args) {
+        log_error("Cannot parse command-line arguments");
+
+        help(NULL);
+
         return 1;
     }
-    else
-        log_debug("java_init done");
 
-    /* Check wether we need to dump the VM version */
-    if (args->vers == true) {
-        log_error("jsvc (Apache Commons Daemon) " JSVC_VERSION_STRING);
-        log_error("Copyright (c) 1999-2011 Apache Software Foundation.");
-        if (java_version() != true) {
-            return -1;
-        }
-        else
-            return 0;
-    }
-    /* Check wether we need to dump the VM version */
-    else if (args->vershow == true) {
-        if (java_version() != true) {
-            return 7;
-        }
+    if (true == args->stop) {
+        return 0 == stop_controller(args) ? 0 : 1;
     }
 
-    /* Do we have to do a "check-only" initialization? */
-    if (args->chck == true) {
-        if (java_check(args) != true)
-            return 2;
-        printf("Service \"%s\" checked successfully\n", args->clas);
+    /* read jvm details */
+
+    jvm_info = home(args->home);
+
+    if (!jvm_info) {
+        log_error("Cannot determine jvm details");
+
+        return 1;
+    }
+
+    if (args->help) {
+        help(jvm_info);
+
         return 0;
     }
 
-    /* Load the service */
-    if (java_load(args) != true) {
-        log_debug("java_load failed");
-        return 3;
+    if (args->vers) {
+        return 0 == print_java_version(args, jvm_info) ? 0 : 1;
     }
-    else
-        log_debug("java_load done");
 
-    /* Downgrade user */
-#ifdef OS_LINUX
-    if (args->user && set_caps(0) != 0) {
-        log_debug("set_caps (0) failed");
-        return 4;
-    }
-#else
-    if (set_user_group(args->user, uid, gid) != 0)
-        return 4;
-#endif
+    /* Start the daemon */
 
-    /* Start the service */
-    umask(envmask);
-    if (java_start() != true) {
-        log_debug("java_start failed");
-        return 5;
+    /* map username to uid and gid, then try to fork and su to that user */
+
+    if (args->user && 0 != read_and_validate_user(args->user, &user)) {
+        return 1;
     }
-    else
-        log_debug("java_start done");
+
+    /* TODO - maybe this is unnecessary now? remove? */
+
+    if (0 != linux_replace_process_image(args, jvm_info, argc, argv)) {
+        log_error("Cannot replace linux process image");
+
+        return 1;
+    }
+
+    snprintf(sem_name, sizeof (sem_name) - 1, "jsvc_sem1_%d", getpid());
+    sem_name[sizeof (sem_name) - 1] = 0;
+
+    sem = sem_open(sem_name, O_CREAT, 0644, 0);
+
+    if (NULL == sem) {
+        fprintf(stderr, "Cannot init controller semaphore: %s",
+                strerror(errno));
+
+        return 1;
+    }
+
+    if (args->dtch) {
+        log_debug("Detaching controller process");
+
+        controller_pid = fork();
+
+        if (0 > controller_pid) {
+            log_error("Cannot detach controller process: %s", strerror(errno));
+
+            return -1;
+        }
+
+        if (0 == controller_pid) {
+            /* In child/controller process */
+
+            /* Create a new session with the controller process as its leader */
+
+            if (0 > setsid()) {
+                log_error("Cannot create new session: %s", strerror(errno));
+
+                return -1;
+            }
+
+            /* then run the controller_main() below */
+
+        } else {
+            /* In parent/original process */
+
+            /* Wait for the controller proc to signal it has detached */
+
+            if (0 != sem_wait(sem)) {
+                log_error("Cannot wait for controller process: %s",
+                        strerror(errno));
+
+                return -1;
+            }
+
+            if (0 != sem_close(sem)) {
+                log_error("Cannot close controller semaphore: %s",
+                        strerror(errno));
+            }
+
+            /* controller has detached */
+
+            log_debug("Controller detached, exiting to shell");
+
+            return 0;
+        }
+    }
+
+    /* Start the monitoring process (controller). */
+
+    result = controller_main(args, jvm_info, &user, sem);
+
+    if (!args->dtch) {
+        if (0 != sem_close(sem)) {
+            log_error("Cannot close controller semaphore: %s",
+                    strerror(errno));
+        }
+    }
+
+    return 0 == result ? result : 1;
+}
+
+int controller_main(
+        const arg_data *args,
+        const struct home_data *jvm_info,
+        const struct passwd *user,
+        sem_t *sem) {
+    FILE *crono_err = NULL;
+    FILE *crono_out = NULL;
+    int first_time = 1;
+    time_t last_jvm_start_sec = 0;
+    time_t now = 0;
+    int exit_code = 0;
+    int signo = 0;
+    int wait_options = 0;
+    int result = -1;
+
+    /* Install controller signal handlers.  */
+
+    if (0 != install_controller_signal_handler()) {
+        delete_controller_pid_file(args);
+
+        return -1;
+    }
+
+    /* Redirect stderr and stdout to cronolog.   Cronlog will do log rotation.
+     * Child processes (JVMs) will inherit the redirected stderr and stdout 
+     */
+
+    if (0 != redirect_stdout_stderr(args, &crono_err, &crono_out)) {
+        delete_controller_pid_file(args);
+
+        return -1;
+    }
+
+    /* Until the controller is instructed to exit or a jvm process exits 
+     * gracefully (is not terminated by a signal), try to keep one jvm
+     * process running at all times
+     */
+
+    while (controller_is_running) {
+
+        /* Start a new jvm process if no jvm process is currently running */
+
+        if (0 > jvm_pid) {
+            /* Do not try to start a new JVM more than once every COOLDOWN_SEC */
+
+            now = time(NULL);
+
+            if (now - last_jvm_start_sec < COOLDOWN_SEC) {
+                sleep(COOLDOWN_SEC - (now - last_jvm_start_sec));
+
+                last_jvm_start_sec = time(NULL);
+            } else {
+                last_jvm_start_sec = now;
+            }
+
+            jvm_pid = fork();
+
+            if (0 > jvm_pid) {
+                log_error("Cannot fork jvm process: %s", strerror(errno));
+
+                delete_controller_pid_file(args);
+
+                return -1;
+            }
+
+            if (0 == jvm_pid) {
+                /* In jvm process */
+
+                return jvm_main(args, jvm_info, user);
+            }
+        }
+
+        /* In controller process */
+
+        if (first_time) {
+            /* First time through, write controller pid to an external pid file 
+             * and signal the original process that the controller has forked
+             * its first jvm.  This could be improved a bit - ideally we'd 
+             * propogate any jvm start failure all the way back to the original
+             * process/shell.
+             */
+
+            if (0 != write_controller_pid_file(args, getpid())) {
+                log_error("Cannot save controller pid to a file");
+
+                return -1;
+            }
+
+            if (0 != sem_post(sem)) {
+                log_error("Cannot signal main process: %s", strerror(errno));
+
+                delete_controller_pid_file(args);
+
+                return -1;
+            }
+
+            first_time = 0;
+        }
+
+        /* Wait until the jvm dies or we're interrupted by a signal handler */
+
+        result = wait_for_child("controller", "jvm", jvm_pid, &exit_code,
+                &signo, wait_options);
+
+        if (SUCCESS_EXIT == result) {
+            log_debug("jvm exited successfully");
+
+            break;
+        }
+
+        if (ERROR_EXIT == result) {
+            if (RELOAD_EXIT_CODE == exit_code) {
+                log_debug("jvm reloading");
+
+                continue;
+            }
+
+            log_error("jvm exited with exit code: %d", exit_code);
+
+            break;
+        }
+
+        if (SIGNAL_EXIT == result) {
+            log_error("jvm killed by signal %d, restarting jvm", signo);
+
+            jvm_pid = -1;
+
+            continue;
+        }
+
+        if (INTERNAL_ERROR == result) {
+            /* This is arguable. */
+            log_error("Controller cannot wait on jvm, exiting");
+
+            break;
+        }
+
+        if (INTERRUPTED == result) {
+            /* signal handler was called while in wait_for_child.  Check to
+             * see if controller_is_running is still true, but do not start a
+             * new jvm process
+             */
+
+            continue;
+        }
+
+        if (CHILD_GONE == result) {
+            log_error("jvm no longer exists, restarting jvm");
+
+            jvm_pid = -1;
+
+            continue;
+        }
+    }
+
+    log_debug("Controller shutdown initiated");
+
+    delete_controller_pid_file(args);
+
+    /* Send cronolog an EOF on its stdin so it will exit. */
+
+    close_stdout_stderr(crono_err, crono_out);
+
+    return 0;
+}
+
+int jvm_main(
+        const arg_data *args,
+        const struct home_data *jvm_info,
+        const struct passwd *user) {
+
+    if (0 != sem_init(&jvm_is_running, 0, 0)) {
+        log_error("Cannot initialize semaphore: %s", strerror(errno));
+
+        return 1;
+    }
+
+    /* Start a new JVM via JNI */
+
+    if (true != java_init(args, jvm_info)) {
+        log_error("Cannot initialize JVM");
+
+        return 2;
+    }
+
+    log_debug("Initialized JVM");
 
     /* Install signal handlers */
-    handler_hup = signal_set(SIGHUP, handler);
-    handler_usr1 = signal_set(SIGUSR1, handler);
-    handler_usr2 = signal_set(SIGUSR2, handler);
-    handler_trm = signal_set(SIGTERM, handler);
-    handler_int = signal_set(SIGINT, handler);
-    controlled = getpid();
 
-    log_debug("Waiting for a signal to be delivered");
-    create_tmp_file(args);
-    while (!stopping) {
-#if defined(OSD_POSIX)
-        java_sleep(60);
-        /* pause(); */
-#else
-        /* pause() is not threadsafe */
-        sleep(60);
-#endif
-        if(doreopen) {
-            doreopen = false;
-            set_output(args->outfile, args->errfile, args->redirectstdin, args->procname);
-        }
-        if(dosignal) {
-            dosignal = false;
-            java_signal();
-        }
+    if (0 != install_jvm_signal_handler()) {
+        log_error("Cannot install jvm signal handler");
+
+        return 3;
     }
-    remove_tmp_file(args);
-    log_debug("Shutdown or reload requested: exiting");
 
-    /* Stop the service */
-    if (java_stop() != true)
+    /* Call org.apache.commons.daemon.support.DaemonLoader.load() via JNI.
+     * This will ultimately call org.apache.commons.daemon.Daemon.init()
+     */
+
+    if (true != java_load(args)) {
+        log_error("Cannot call Daemon.init()");
+
+        return 4;
+    }
+
+    log_debug("Daemon.init() succeeded");
+
+    /* Drop priviledges */
+
+    if (0 != drop_privileges(user)) {
+        log_error("Cannot perform privilege deescalation");
+
+        return 5;
+    }
+
+    /* Call  org.apache.commons.daemon.Daemon.start() via JNI */
+
+    if (true != java_start()) {
+        log_error("Cannot call Daemon.start()");
+
         return 6;
+    }
 
-    if (doreload == true)
-        ret = 123;
-    else
-        ret = 0;
+    log_debug("Daemon.start() succeeded");
 
-    /* Destroy the service */
-    java_destroy();
+    if (0 != sem_wait(&jvm_is_running)) {
+        log_error("Cannot wait on jvm semaphore: %s", strerror(errno));
+    }
 
-    /* Destroy the Java VM */
-    if (JVM_destroy(ret) != true)
-        return 7;
+    log_debug("Daemon shutting down");
 
-    return ret;
+    /* Call org.apache.commons.daemon.Daemon.stop() via JNI */
+
+    if (true != java_stop()) {
+        log_error("Daemon.stop() failed");
+
+        return reload_jvm ? 123 : 7;
+    }
+
+    log_debug("Daemon.stop() succeeded");
+
+    /* Call org.apache.commons.daemon.Daemon.destroy() via JNI */
+
+    if (true != java_destroy()) {
+        log_error("Daemon.destroy() failed");
+
+        return reload_jvm ? 123 : 8;
+    }
+
+    log_debug("Daemon.destroy() succeeded");
+
+    /* Destroy the JVM itself */
+
+    if (true != JVM_destroy(reload_jvm ? 123 : 0)) {
+        log_error("JVM destroy failed");
+
+        return reload_jvm ? 123 : 9;
+    }
+
+    log_debug("Daemon successfully shut down");
+
+    return reload_jvm ? 123 : 0;
 }
 
-/*
- * freopen close the file first and then open the new file
- * that is not very good if we are try to trace the output
- * note the code assumes that the errors are configuration errors.
+child_status wait_for_child(
+        const char *parent_name,
+        const char *child_name,
+        pid_t child_pid,
+        int *exit_code,
+        int *signo,
+        int wait_options) {
+    int status = 0;
+    pid_t result = -1;
+
+    *signo = -1;
+    *exit_code = -1;
+
+    while (1) {
+        result = waitpid(child_pid, &status, wait_options);
+
+        if (-1 == result) {
+            switch (errno) {
+                case EINTR:
+
+                    log_debug("%s --wait--> %s:%d, interrupted by signal",
+                            parent_name, child_name, child_pid);
+
+                    return INTERRUPTED;
+
+                case ECHILD:
+
+                    log_debug("%s --wait--> %s:%d, child no longer exists",
+                            parent_name, child_name, child_pid);
+
+                    return CHILD_GONE;
+
+                default:
+
+                    log_error("%s --wait--> %s:%d, error=%s",
+                            parent_name, child_name, child_pid, strerror(errno));
+
+                    return INTERNAL_ERROR;
+            }
+        }
+
+        if (WIFEXITED(status)) {
+            *exit_code = WEXITSTATUS(status);
+
+            log_error("%s --wait--> %s:%d, %s exited=%d",
+                    parent_name, child_name, child_pid, child_name, *exit_code);
+
+            return 0 == *exit_code ? SUCCESS_EXIT : ERROR_EXIT;
+        }
+
+        if (WIFSIGNALED(status)) {
+            *signo = WTERMSIG(status);
+
+            log_error("%s --wait--> %s:%d, %s killed by signal=%d",
+                    parent_name, child_name, child_pid, child_name, *signo);
+
+            return SIGNAL_EXIT;
+        }
+
+        if (WIFSTOPPED(status)) {
+            log_debug("%s --wait--> %s:%d, %s stopped by signal=%d",
+                    parent_name, child_name, child_pid, child_name,
+                    WSTOPSIG(status));
+
+            continue;
+        }
+
+        if (WIFCONTINUED(status)) {
+            log_debug("%s --wait--> %s:%d, %s continuing",
+                    parent_name, child_name, child_pid, child_name);
+
+            continue;
+        }
+
+        log_error("%s --wait--> %s:%d, unknown waitpid() status.");
+
+        return INTERNAL_ERROR;
+    }
+}
+
+int read_and_validate_user(const char *username, struct passwd *user) {
+    struct passwd *result = NULL;
+    char *buffer = NULL;
+    int buffer_size = 0;
+    int retval = 0;
+    pid_t pid = 0;
+    child_status status;
+    int exit_code = 0;
+    int signo = 0;
+
+    /* translate username to uid_t and gid_t */
+
+    if (!username || !user) {
+        return -1;
+    }
+
+    buffer_size = sysconf(_SC_GETPW_R_SIZE_MAX);
+
+    if (0 > buffer_size) {
+        buffer_size = 16 * 1024;
+    }
+
+    buffer = (char *) malloc(buffer_size);
+
+    if (NULL == buffer) {
+        log_error("Cannot allocate buffer for getpwnam_r, error=%s",
+                strerror(errno));
+
+        return -1;
+    }
+
+    retval = getpwnam_r(username, user, buffer, buffer_size, &result);
+
+    free(buffer);
+    buffer = NULL;
+
+    if (NULL == result) {
+        if (0 == retval) {
+            log_error("User %s does not exist", username);
+            return -1;
+        }
+
+        log_error("User %s cannot be read, error=%s", strerror(errno));
+
+        return -1;
+    }
+
+    log_debug("User %s has uid %d and gid %d", username, user->pw_uid,
+            user->pw_gid);
+
+    /* Validate the user name in another process */
+
+    pid = fork();
+
+    if (-1 == pid) {
+        /* fork failed */
+
+        log_error("Cannot fork new process to validate user, error=%s",
+                strerror(errno));
+
+        return -1;
+    }
+
+    if (0 == pid) {
+        /* in child process */
+
+        if (0 == drop_privileges(user)) {
+            exit(EXIT_SUCCESS);
+        }
+
+        exit(EXIT_FAILURE);
+    }
+
+    /* in parent process */
+
+    status = wait_for_child("main", "usertest", pid, &exit_code, &signo, 0);
+
+    if (SUCCESS_EXIT != status) {
+        log_error("Cannot validate user %s", username);
+
+        return -1;
+    }
+
+    log_debug("Validated user %s", username);
+
+    return 0;
+}
+
+/* On some UNIX operating systems, we need to REPLACE this current
+ * process image with another one (thru execve) to allow the correct
+ * loading of VMs (notably this is for Linux). Set, replace, and go. 
  */
-static FILE *loc_freopen(char *outfile, char *mode, FILE * stream)
-{
-    FILE *ftest;
+int linux_replace_process_image(
+        const arg_data *args,
+        const struct home_data *jvm_info,
+        int argc,
+        const char **argv) {
 
-    ftest = fopen(outfile, mode);
-    if (ftest == NULL) {
-        fprintf(stderr, "Unable to redirect to %s\n", outfile);
-        return stream;
-    }
-    fclose(ftest);
-    return freopen(outfile, mode, stream);
-}
+    /* TODO clean up this function - largey unmodified from jsvc original. */
 
-#define LOGBUF_SIZE 1024
+#ifdef OS_LINUX_TODO
+    char *oldpath = getenv("LD_LIBRARY_PATH");
+    char *libf = select_jvm(jvm_info, args->name);
+    char *filename;
+    char buf[2048];
+    int ret;
+    char *tmp = NULL;
+    char *p1 = NULL;
+    char *p2 = NULL;
+    char **argv2 = NULL;
 
-/* Read from file descriptors. Log to syslog. */
-static int logger_child(int out_fd, int err_fd, char *procname)
-{
-    fd_set rfds;
-    struct timeval tv;
-    int retval, nfd = -1, rc = 0;
-    ssize_t n;
-    char buf[LOGBUF_SIZE];
-
-    if (out_fd == -1 && err_fd == -1)
-        return EINVAL;
-    if (out_fd == -1)
-        nfd = err_fd;
-    else if (err_fd == -1)
-        nfd = out_fd;
-    else
-        nfd = out_fd > err_fd ? out_fd : err_fd;
-    ++nfd;
-
-    openlog(procname, LOG_PID, LOG_DAEMON);
-
-    while (out_fd != -1 || err_fd != -1) {
-        FD_ZERO(&rfds);
-        if (out_fd != -1) {
-            FD_SET(out_fd, &rfds);
-        }
-        if (err_fd != -1) {
-            FD_SET(err_fd, &rfds);
-        }
-        tv.tv_sec  = 60;
-        tv.tv_usec = 0;
-        retval = select(nfd, &rfds, NULL, NULL, &tv);
-        if (retval == -1) {
-            rc = errno;
-            syslog(LOG_ERR, "select: %s", strerror(errno));
-            /* If select failed no point to continue */
-            break;
-        }
-        else if (retval) {
-            if (out_fd != -1 && FD_ISSET(out_fd, &rfds)) {
-                do {
-                    n = read(out_fd, buf, LOGBUF_SIZE-1);
-                } while (n == -1 && errno == EINTR);
-                if (n == -1) {
-                    syslog(LOG_ERR, "read: %s", strerror(errno));
-                    close(out_fd);
-                    if (err_fd == -1)
-                        break;
-                    nfd = err_fd + 1;
-                    out_fd = -1;
-                }
-                else if (n > 0 && buf[0] != '\n') {
-                    buf[n] = 0;
-                    syslog(LOG_INFO, "%s", buf);
-                }
-            }
-            if (err_fd != -1 && FD_ISSET(err_fd, &rfds)) {
-                do {
-                    n = read(err_fd, buf, LOGBUF_SIZE-1);
-                } while (n == -1 && errno == EINTR);
-                if (n == -1) {
-                    syslog(LOG_ERR, "read: %s", strerror(errno));
-                    close(err_fd);
-                    if (out_fd == -1)
-                        break;
-                    nfd = out_fd + 1;
-                    err_fd = -1;
-                }
-                else if (n > 0 && buf[0] != '\n') {
-                    buf[n] = 0;
-                    syslog(LOG_ERR, "%s", buf);
-                }
-            }
-        }
-    }
-    return rc;
-}
-
-/**
- *  Redirect stdin, stdout, stderr.
- */
-static void set_output(char *outfile, char *errfile, bool redirectstdin, char *procname)
-{
-    int out_pipe[2] = {-1, -1};
-    int err_pipe[2] = {-1, -1};
-    int fork_needed = 0;
-
-    if (redirectstdin == true) {
-        freopen("/dev/null", "r", stdin);
-    }
-
-    log_debug("redirecting stdout to %s and stderr to %s", outfile, errfile);
-
-    /* make sure the debug goes out */
-    if (log_debug_flag == true && strcmp(errfile, "/dev/null") == 0)
-        return;
-    if (strcmp(outfile, "&1") == 0 && strcmp(errfile, "&2") == 0)
-        return;
-    if (strcmp(outfile, "SYSLOG") == 0) {
-        freopen("/dev/null", "a", stdout);
-        /* Send stdout to syslog through a logger process */
-        if (pipe(out_pipe) == -1) {
-            log_error("cannot create stdout pipe: %s",
-                      strerror(errno));
-        }
-        else {
-            fork_needed = 1;
-            log_stdout_syslog_flag = true;
-        }
-    }
-    else if (strcmp(outfile, "&2")) {
-        if (strcmp(outfile, "&1")) {
-            /* Redirect stdout to a file */
-            loc_freopen(outfile, "a", stdout);
-        }
-    }
-
-    if (strcmp(errfile, "SYSLOG") == 0) {
-        freopen("/dev/null", "a", stderr);
-        /* Send stderr to syslog through a logger process */
-        if (pipe(err_pipe) == -1) {
-            log_error("cannot create stderr pipe: %s",
-                      strerror(errno));
-        }
-        else {
-            fork_needed = 1;
-            log_stderr_syslog_flag = true;
-        }
-    }
-    else if (strcmp(errfile, "&1")) {
-        if (strcmp(errfile, "&2")) {
-            /* Redirect stderr to a file */
-            loc_freopen(errfile, "a", stderr);
-        }
-    }
-    if (strcmp(errfile, "&1") == 0 && strcmp(outfile, "&1")) {
-        /*
-         * -errfile &1 -outfile foo
-         * Redirect stderr to stdout
-         */
-        close(2);
-        dup2(1, 2);
-    }
-    if (strcmp(outfile, "&2") == 0 && strcmp(errfile, "&2")) {
-        /*
-         * -outfile &2 -errfile foo
-         * Redirect stdout to stderr
-         */
-        close(1);
-        dup2(2, 1);
-    }
-
-    if (fork_needed) {
-        pid_t pid = fork();
-        if (pid == -1) {
-            log_error("cannot create logger process: %s", strerror(errno));
-        }
-        else {
-            if (pid != 0) {
-                /* Parent process.
-                 * Close child pipe endpoints.
-                 */
-                logger_pid = pid;
-                if (out_pipe[0] != -1) {
-                    close(out_pipe[0]);
-                    if (dup2(out_pipe[1], 1) == -1) {
-                        log_error("cannot redirect stdout to pipe for syslog: %s",
-                                  strerror(errno));
-                    }
-                }
-                if (err_pipe[0] != -1) {
-                    close(err_pipe[0]);
-                    if (dup2(err_pipe[1], 2) == -1) {
-                        log_error("cannot redirect stderr to pipe for syslog: %s",
-                                  strerror(errno));
-                    }
-                }
-            }
-            else {
-                exit(logger_child(out_pipe[0], err_pipe[0], procname));
-            }
-        }
-    }
-}
-
-int main(int argc, char *argv[])
-{
-    arg_data *args  = NULL;
-    home_data *data = NULL;
-    pid_t pid  = 0;
-    uid_t uid  = 0;
-    gid_t gid  = 0;
-    int res;
-
-    /* Parse command line arguments */
-    args = arguments(argc, argv);
-    if (args == NULL)
-        return 1;
-
-    /* Stop running jsvc if required */
-    if (args->stop == true)
-        return (stop_child(args));
-
-    /* Let's check if we can switch user/group IDs */
-    if (checkuser(args->user, &uid, &gid) == false)
-        return 1;
-
-    /* Retrieve JAVA_HOME layout */
-    data = home(args->home);
-    if (data == NULL)
-        return 1;
-
-    /* Check for help */
-    if (args->help == true) {
-        help(data);
-        return 0;
-    }
-
-#ifdef OS_LINUX
-    /* On some UNIX operating systems, we need to REPLACE this current
-       process image with another one (thru execve) to allow the correct
-       loading of VMs (notably this is for Linux). Set, replace, and go. */
     if (strcmp(argv[0], args->procname) != 0) {
-        char *oldpath = getenv("LD_LIBRARY_PATH");
-        char *libf    = java_library(args, data);
-        char *filename;
-        char  buf[2048];
-        int   ret;
-        char *tmp = NULL;
-        char *p1  = NULL;
-        char *p2  = NULL;
-
         /*
          * There is no need to change LD_LIBRARY_PATH
          * if we were not able to find a path to libjvm.so
          * (additionaly a strdup(NULL) cores dump on my machine).
          */
         if (libf != NULL) {
-            p1  = strdup(libf);
+            p1 = strdup(libf);
             tmp = strrchr(p1, '/');
             if (tmp != NULL)
                 tmp[0] = '\0';
 
-            p2  = strdup(p1);
+            p2 = strdup(p1);
             tmp = strrchr(p2, '/');
             if (tmp != NULL)
                 tmp[0] = '\0';
@@ -1115,11 +799,11 @@ int main(int argc, char *argv[])
             setenv("LD_LIBRARY_PATH", tmp, 1);
 
             log_debug("Invoking w/ LD_LIBRARY_PATH=%s",
-                      getenv("LD_LIBRARY_PATH"));
+                    getenv("LD_LIBRARY_PATH"));
         }
 
         /* execve needs a full path */
-        ret = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        ret = readlink("/proc/self/exe", buf, sizeof (buf) - 1);
         if (ret <= 0)
             strcpy(buf, argv[0]);
         else
@@ -1127,141 +811,574 @@ int main(int argc, char *argv[])
 
         filename = buf;
 
-        argv[0] = args->procname;
-        execve(filename, argv, environ);
-        log_error("Cannot execute JSVC executor process (%s)", filename);
-        return 1;
+        argv2 = (char **) malloc((argc + 1) * sizeof (char *));
+
+        if (!argv2) {
+            log_error("Cannot duplicate argv, out of memory");
+
+            return -1;
+        }
+
+        memcpy(argv2, argv, (argc + 1) * sizeof (char *));
+
+        argv2[0] = args->procname;
+
+        execve(filename, argv2, environ);
+
+        free(argv2);
+
+        log_error("Cannot execute JSVC executor process (%s): %s",
+                filename, strerror(errno));
+
+        return -1;
     }
+
     log_debug("Running w/ LD_LIBRARY_PATH=%s", getenv("LD_LIBRARY_PATH"));
-#endif /* ifdef OS_LINUX */
 
-    /* If we have to detach, let's do it now */
-    if (args->dtch == true) {
-        pid = fork();
-        if (pid == -1) {
-            log_error("Cannot detach from parent process");
-            return 1;
-        }
-        /* If we're in the parent process */
-        if (pid != 0) {
-            if (args->wait >= 10)
-                return wait_child(args, pid);
-            else
-                return 0;
-        }
-#ifndef NO_SETSID
-        setsid();
-#endif
+#endif /* ifdef OS_LINUX */    
+
+    return 0;
+}
+
+#ifdef OS_LINUX_TODO
+
+const char *select_jvm(const struct home_data *jvm_info, const char *jvm_name) {
+
+    const char *libf = NULL;
+    int i = 0;
+
+    /* Did we find ANY virtual machine? */
+
+    if (0 == jvm_info->jnum) {
+        log_error("Cannot find any VM in Java Home %s", jvm_info->path);
+
+        return NULL;
     }
 
-    /*
-     * umask() uses inverse logic; bits are CLEAR for allowed access.
+    /* If the vm wasn't named, pick the first */
+
+    if (!jvm_name) {
+        libf = jvm_info->jvms[0]->libr;
+
+        log_debug("Using default JVM in %s", libf);
+
+        return libf;
+    }
+
+    /* else match the name */
+
+    for (i = 0; i < jvm_info->jnum; i++) {
+        if (!jvm_info->jvms[i]->name) {
+            continue;
+        }
+
+        if (0 == strcmp(jvm_name, jvm_info->jvms[i]->name)) {
+            libf = jvm_info->jvms[i]->libr;
+
+            log_debug("Using specific JVM in %s", libf);
+
+            return libf;
+        }
+    }
+
+    log_error("Invalid JVM name specified %s", jvm_name);
+
+    return NULL;
+}
+
+#endif
+
+/**
+ * Redirect stderr and stdout to cronolog.   The caller must later call 
+ * close_stdout_stderr on the two file handles or else cronolog will continue
+ * running after the calling process exits.
+ * 
+ * @param args
+ * @param crono_err
+ * @param crono_out
+ * @return 
+ */
+int redirect_stdout_stderr(
+        const arg_data *args,
+        FILE **crono_err,
+        FILE **crono_out) {
+    const char *outfile = args->outfile;
+    const char *errfile = args->errfile;
+
+    /* unconditionally close stdin, we don't need it. */
+
+    fclose(stdin);
+
+    if (0 == strcmp(errfile, "/dev/null")) {
+        if (NULL == freopen(errfile, "w", stderr)) {
+            log_error("Cannot redirect stderr to /dev/null: %s",
+                    strerror(errno));
+
+            return -1;
+        }
+    } else {
+        char cmd[1024];
+        cmd[sizeof (cmd) - 1] = 0;
+
+        snprintf(cmd, sizeof (cmd) - 1, CRONO_FMT, errfile, errfile);
+
+        *crono_err = popen(cmd, "w");
+
+        if (!*crono_err) {
+            log_error("Cannot open cronolog for stderr: file=%s, err=%s",
+                    errfile, strerror(errno));
+
+            return -1;
+        }
+
+        /* turn off buffering.  stderr and stdout will do their own buffering
+         * as appropriate
+         */
+
+        setbuf(*crono_err, NULL);
+
+        /* redirect the stderr file descriptor to cronolog's stdin */
+
+        if (-1 == dup2(fileno(*crono_err), 2)) {
+            log_error("Cannot redirect stderr to cronlog: %s", strerror(errno));
+
+            return -1;
+        }
+
+        log_debug("Stderr redirected to %s", errfile);
+    }
+
+    if (0 == strcmp(outfile, "/dev/null")) {
+        if (NULL == freopen(outfile, "w", stdout)) {
+            log_error("Cannot redirect stdout to /dev/null: %s",
+                    strerror(errno));
+
+            return -1;
+        }
+    } else {
+        if (0 == strcmp(outfile, errfile)) {
+            /* If stderr and stdout go to the same file, use the stderr cronolog
+             * file handle.
+             * 
+             * Implication: caller has to be smart enough to not pclose
+             * both crono_out and crono_err if they are the same.  This is
+             * handled by close_stdout_stderr().
+             */
+
+            *crono_out = *crono_err;
+        } else {
+            /* Otherwise create a separate cronolog process for stdout */
+
+            char cmd[1024];
+            cmd[sizeof (cmd) - 1] = 0;
+
+            snprintf(cmd, sizeof (cmd) - 1, CRONO_FMT, outfile, outfile);
+
+            *crono_out = popen(cmd, "w");
+
+            if (!*crono_out) {
+                log_error("Cannot open cronolog for stdout: file=%s, err=%s",
+                        outfile, strerror(errno));
+
+                return -1;
+            }
+
+            /* turn off buffering.  stderr and stdout will do their own buffering
+             * as appropriate
+             */
+
+            setbuf(*crono_out, NULL);
+        }
+
+        /* redirect the stdout file descriptor to cronolog's stdin */
+
+        if (-1 == dup2(fileno(*crono_out), 1)) {
+            log_error("Cannot redirect stdout to cronlog: %s", strerror(errno));
+
+            return -1;
+        }
+
+        log_debug("stdout redirected to %s", outfile);
+    }
+
+    return 0;
+}
+
+void close_stdout_stderr(FILE *crono_err, FILE *crono_out) {
+    if (crono_err) {
+        pclose(crono_err);
+    }
+
+    if (crono_out && crono_out != crono_err) {
+        pclose(crono_out);
+    }
+}
+
+int install_controller_signal_handler() {
+    if (SIG_ERR == signal(SIGHUP, controller_signal_handler)) {
+        log_error("Cannot install controller SIGHUP handler: %s",
+                strerror(errno));
+
+        return -1;
+    }
+
+    if (SIG_ERR == signal(SIGUSR1, controller_signal_handler)) {
+        log_error("Cannot install controller SIGUSR1 handler: %s",
+                strerror(errno));
+
+        return -1;
+    }
+
+    if (SIG_ERR == signal(SIGUSR2, controller_signal_handler)) {
+        log_error("Cannot install controller SIGUSR2 handler: %s",
+                strerror(errno));
+
+        return -1;
+    }
+
+    if (SIG_ERR == signal(SIGTERM, controller_signal_handler)) {
+        log_error("Cannot install controller SIGTERM handler: %s",
+                strerror(errno));
+
+        return -1;
+    }
+
+    if (SIG_ERR == signal(SIGINT, controller_signal_handler)) {
+        log_error("Cannot install controller SIGINT handler: %s",
+                strerror(errno));
+
+        return -1;
+    }
+
+    if (SIG_ERR == signal(SIGCHLD, SIG_IGN)) {
+        log_error("Cannot ignore SIGCHLD: %s", strerror(errno));
+
+        return -1;
+    }
+
+    return 0;
+}
+
+int install_jvm_signal_handler() {
+    if (SIG_ERR == signal(SIGHUP, jvm_signal_handler)) {
+        log_error("Cannot install jvm SIGHUP handler: %s", strerror(errno));
+
+        return -1;
+    }
+
+    if (SIG_ERR == signal(SIGUSR1, jvm_signal_handler)) {
+        log_error("Cannot install jvm SIGUSR1 handler: %s", strerror(errno));
+
+        return -1;
+    }
+
+    if (SIG_ERR == signal(SIGUSR2, jvm_signal_handler)) {
+        log_error("Cannot install jvm SIGUSR2 handler: %s", strerror(errno));
+
+        return -1;
+    }
+
+    if (SIG_ERR == signal(SIGTERM, jvm_signal_handler)) {
+        log_error("Cannot install jvm SIGTERM handler: %s", strerror(errno));
+
+        return -1;
+    }
+
+    if (SIG_ERR == signal(SIGINT, jvm_signal_handler)) {
+        log_error("Cannot install jvm SIGINT handler: %s", strerror(errno));
+
+        return -1;
+    }
+
+    if (SIG_ERR == signal(SIGPIPE, SIG_IGN)) {
+        log_error("Cannot set SIGPIPE to ignore: %s", strerror(errno));
+
+        return -1;
+    }
+
+    return 0;
+}
+
+int drop_privileges(const struct passwd *user) {
+    if (NULL == user) {
+        log_debug("Not dropping privs");
+
+        return 0;
+    }
+
+    if (0 != setgid(user->pw_gid)) {
+        log_error("Cannot change group to %d: %s",
+                user->pw_gid,
+                strerror(errno));
+
+        return -1;
+    }
+
+    if (0 != initgroups(user->pw_name, user->pw_gid)) {
+        log_error("Cannot set supplemental group list: %s", strerror(errno));
+
+        return -1;
+    }
+
+    if (0 != setuid(user->pw_uid)) {
+        log_error("Cannot change user to %d: %s",
+                user->pw_uid,
+                strerror(errno));
+    }
+
+    log_debug("Changed to user:group %d:%d", user->pw_uid, user->pw_gid);
+
+    return 0;
+}
+
+void controller_signal_handler(int signo) {
+    switch (signo) {
+        case SIGHUP:
+
+            /* Forward the SIGHUP to the JVM process.  It should exit 123 
+             * which will inform this controller process to restart it.
+             */
+
+            if (0 < jvm_pid) {
+                kill(jvm_pid, SIGHUP);
+            }
+
+            break;
+
+        default:
+
+            /* For everthign else, forward the signal to the JVM process, then
+             * start the shutdown sequence.
+             */
+
+            if (0 < jvm_pid) {
+                kill(jvm_pid, signo);
+            }
+
+            controller_is_running = 0;
+    }
+}
+
+void jvm_signal_handler(int signo) {
+    switch (signo) {
+        case SIGHUP:
+
+            reload_jvm = 1;
+
+            /* fall through */
+
+        default:
+
+            sem_post(&jvm_is_running);
+    }
+}
+
+read_pid_status read_controller_pid_file(
+        const arg_data *args,
+        pid_t *controller_pid) {
+    int fd = -1;
+    int bytes_read = 0;
+    ssize_t result = 0;
+    char buffer[80];
+
+    memset(buffer, 0, sizeof (buffer));
+
+    fd = open(args->pidf, O_RDONLY, 0);
+
+    if (0 > fd) {
+        log_error("Cannot open pid file %s: %s", args->pidf, strerror(errno));
+
+        return ENOENT == errno ? NO_FILE : ERROR;
+    }
+
+    while (bytes_read < sizeof (buffer) - 1) {
+        result = read(fd, buffer + bytes_read, sizeof (buffer) - 1 - bytes_read);
+
+        if (0 > result) {
+            log_error("Cannot read pid from file %s: %s", args->pidf,
+                    strerror(errno));
+
+            return ERROR;
+        }
+
+        if (0 == result) {
+            break;
+        }
+
+        bytes_read += result;
+    }
+
+    close(fd);
+    fd = -1;
+
+    if (0 >= bytes_read) {
+        log_error("Pid file %s is empty", args->pidf);
+
+        return ERROR;
+    }
+
+    log_debug("Read pid %s from file %s", buffer, args->pidf);
+
+    *controller_pid = atoi(buffer);
+
+    return SUCCESS;
+}
+
+int write_controller_pid_file(const arg_data *args, pid_t controller_pid) {
+    char buffer[80];
+    int bytes_written = 0;
+    int bytes_to_write = 0;
+    ssize_t result = 0;
+    int fd = -1;
+
+    memset(buffer, 0, sizeof (buffer));
+
+    snprintf(buffer, sizeof (buffer) - 1, "%d", controller_pid);
+
+    bytes_to_write = strlen(buffer);
+
+    fd = open(args->pidf, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+
+    if (0 > fd) {
+        log_error("Cannot open pid file %s: %s", args->pidf, strerror(errno));
+
+        return -1;
+    }
+
+    while (bytes_written < bytes_to_write) {
+        result = read(
+                fd, 
+                buffer + bytes_written, 
+                bytes_to_write - bytes_written);
+
+        if (0 > result) {
+            log_error("Cannot write pid %d to file %s: %s", 
+                    controller_pid, args->pidf, strerror(errno));
+
+            return -1;
+        }
+
+        bytes_written += result;
+    }
+
+    close(fd);
+    fd = -1;
+    
+    log_debug("Wrote pid %d to file %s", controller_pid, args->pidf);
+
+    return 0;
+}
+
+int delete_controller_pid_file(const arg_data *args) {
+    if (0 != unlink(args->pidf)) {
+        if (ENOENT == errno) {
+            log_debug("Controller pid file %s already deleted", args->pidf);
+
+            return 0;
+        }
+
+        log_error("Cannot delete controller pid file %s: %s", args->pidf,
+                strerror(errno));
+
+        return -1;
+    }
+
+    log_debug("Controller pid file %s deleted", args->pidf);
+
+    return 0;
+}
+
+int stop_controller(const arg_data *args) {
+    pid_t pid = -1;
+    int i = 0;
+
+    switch (read_controller_pid_file(args, &pid)) {
+        case NO_FILE:
+
+            log_debug("Pid file %s doesn't exist, assuming controller dead",
+                    args->pidf);
+
+            return 0;
+
+        case ERROR:
+
+            log_error("Cannot stop controller, cannot read pid file %s",
+                    args->pidf);
+
+            return -1;
+
+        default:
+
+            /* successfully read controller pid */
+
+            break;
+    }
+
+    /* kill the process and wait until the pidfile has been
+     * removed by the controler
      */
-    if (~args->umask & 0022) {
-        log_error("NOTICE: jsvc umask of %03o allows "
-                  "write permission to group and/or other", args->umask);
-    }
-    envmask = umask(args->umask);
-    set_output(args->outfile, args->errfile, args->redirectstdin, args->procname);
-    log_debug("Switching umask back to %03o from %03o", envmask, args->umask);
-    res = run_controller(args, data, uid, gid);
-    if (logger_pid != 0) {
-        kill(logger_pid, SIGTERM);
+
+    if (0 != kill(pid, SIGTERM)) {
+        log_error("Cannot kill controller: pid=%d, err=%s", pid,
+                strerror(errno));
+
+        return -1;
     }
 
-    return res;
+    for (i = 0; i < STOP_TIMEOUT_SEC; ++i) {
+        sleep(1);
+
+        if (NO_FILE == read_controller_pid_file(args, &pid)) {
+            log_debug("Controller has exited");
+
+            return 0;
+        }
+    }
+
+    log_error("Giving up after waiting %d seconds for controller to exit",
+            STOP_TIMEOUT_SEC);
+
+    return -1;
 }
 
-static int run_controller(arg_data *args, home_data *data, uid_t uid,
-                          gid_t gid)
-{
-    pid_t pid = 0;
+int print_java_version(const arg_data *args, const struct home_data *jvm_info) {
+    bool result = false;
 
+    if (true != java_init(args, jvm_info)) {
+        log_error("Cannot initialize JVM");
 
-    /* We have to fork: this process will become the controller and the other
-       will be the child */
-    while ((pid = fork()) != -1) {
-        time_t laststart;
-        int status = 0;
-        /* We forked (again), if this is the child, we go on normally */
-        if (pid == 0)
-            exit(child(args, data, uid, gid));
-        laststart = time(NULL);
-
-        /* We are in the controller, we have to forward all interesting signals
-           to the child, and wait for it to die */
-        controlled = pid;
-#ifdef OS_CYGWIN
-        SetTerm(cygwincontroller);
-#endif
-        signal(SIGHUP, controller);
-        signal(SIGUSR1, controller);
-        signal(SIGUSR2, controller);
-        signal(SIGTERM, controller);
-        signal(SIGINT, controller);
-
-        while (waitpid(pid, &status, 0) != pid) {
-            /* Waith for process */
-        }
-
-        /* The child must have exited cleanly */
-        if (WIFEXITED(status)) {
-            status = WEXITSTATUS(status);
-
-            /* Delete the pid file */
-            if (args->vers != true && args->chck != true && status != 122)
-                unlink(args->pidf);
-
-            /* If the child got out with 123 he wants to be restarted */
-            /* See java_abort123 (we use this return code to restart when the JVM aborts) */
-            if (status == 123) {
-                log_debug("Reloading service");
-                /* prevent looping */
-                if (laststart + 60 > time(NULL)) {
-                    log_debug("Waiting 60 s to prevent looping");
-                    sleep(60);
-                }
-                continue;
-            }
-            /* If the child got out with 0 he is shutting down */
-            if (status == 0) {
-                log_debug("Service shut down");
-                return 0;
-            }
-            /* Otherwise we don't rerun it */
-            log_error("Service exit with a return value of %d", status);
-            return 1;
-
-        }
-        else {
-            if (WIFSIGNALED(status)) {
-                log_error("Service killed by signal %d", WTERMSIG(status));
-                /* prevent looping */
-                if (laststart + 60 > time(NULL)) {
-                    log_debug("Waiting 60 s to prevent looping");
-                    sleep(60);
-                }
-                continue;
-            }
-            log_error("Service did not exit cleanly", status);
-            return 1;
-        }
+        return -1;
     }
 
-    /* Got out of the loop? A fork() failed then. */
-    log_error("Cannot decouple controller/child processes");
-    return 1;
+    printf("jsvc (Apache Commons Daemon) " JSVC_VERSION_STRING);
+    printf("Copyright (c) 1999-2012 Apache Software Foundation.");
 
+    result = java_version();
+
+    if (false == JVM_destroy(result ? 0 : 1)) {
+        log_error("JVM destroy failed");
+    }
+
+    return result ? 0 : -1;
 }
 
-void main_reload(void)
-{
-    log_debug("Killing self with HUP signal");
-    kill(controlled, SIGHUP);
+/* These two functions can be called from within the JVM to do an orderly
+ * shutdown or reload
+ */
+
+void main_reload(void) {
+    log_debug("JVM requested reload");
+    
+    reload_jvm = 1;
+    
+    sem_post(&jvm_is_running);
 }
 
 void main_shutdown(void)
 {
-    log_debug("Killing self with TERM signal");
-    kill(controlled, SIGTERM);
+    log_debug("JVM requested shutdown");
+    
+    reload_jvm = 0;
+    
+    sem_post(&jvm_is_running);
 }

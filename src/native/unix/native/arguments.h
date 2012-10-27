@@ -85,7 +85,7 @@ typedef struct {
  * @return A pointer to a arg_data structure containing the parsed command
  *         line arguments, or NULL if an error was detected.
  */
-arg_data *arguments(int argc, char *argv[]);
+arg_data *arguments(int argc, const char *argv[]);
 
 #ifdef __cplusplus
 }

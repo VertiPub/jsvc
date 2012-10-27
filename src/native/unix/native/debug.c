@@ -20,7 +20,7 @@
 #include <unistd.h>
 #include <time.h>
 
-/* Wether debug is enabled or not */
+/* Whether debug is enabled or not */
 bool log_debug_flag = false;
 
 /* Wether SYSLOG logging (for stderr) is enable or not. */
@@ -32,56 +32,61 @@ bool log_stdout_syslog_flag = false;
 /* The name of the jsvc binary. */
 char *log_prog = "jsvc";
 
-/* Dump a debug trace message to stderr */
-void log_debug(const char *fmt, ...)
-{
-    va_list ap;
+void log_internal(
+        FILE *file, 
+        const char *level, 
+        const char *format, 
+        va_list *ap) {
     time_t now;
-    struct tm *nowtm;
-    char buff[80];
+    struct tm localtime;
+    char buffer[513];
 
-    if (log_debug_flag == false)
+    if (NULL == format) {
         return;
-    if (fmt == NULL)
-        return;
+    }
 
-    now   = time(NULL);
-    nowtm = localtime(&now);
-    strftime(buff, sizeof(buff), "%Y-%m-%d %T", nowtm);
-    va_start(ap, fmt);
-    if (log_stderr_syslog_flag)
-        fprintf(stderr, "%s %d %s debug: ", buff, getpid(), log_prog);
-#if defined(DEBUG) || defined(_DEBUG)
-    else
-        fprintf(stderr, "[debug] %s %d ", buff, getpid());
-#endif
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    fflush(stderr);
+    buffer[sizeof (buffer) - 1] = 0;
+
+    now = time(NULL);
+    localtime_r(&now, &localtime);
+
+    vsnprintf(buffer, sizeof (buffer) - 1, format, *ap);
+
+    fprintf(file, "%d-%d-%d %d:%d:%d %s [%d] %s\n",
+            1900 + localtime.tm_year, localtime.tm_mon + 1, localtime.tm_mday,
+            localtime.tm_hour, localtime.tm_min, localtime.tm_sec,
+            level, getpid(), buffer);
+
+    if (file == stdout) {
+        fflush(stdout);
+    }
+}
+
+/* Dump a debug trace message to stdout */
+void log_debug(const char *format, ...) {
+    va_list ap;
+
+    if (!log_debug_flag) {
+        return;
+    }
+
+    va_start(ap, format);
+
+    return log_internal(stdout, "DEBUG", format, &ap);
+
     va_end(ap);
 }
 
 /* Dump an error message to stderr */
-void log_error(const char *fmt, ...)
-{
+void log_error(const char *format, ...) {
     va_list ap;
-    time_t now;
-    struct tm *nowtm;
-    char buff[80];
 
-    if (fmt == NULL)
-        return;
+    va_start(ap, format);
 
-    va_start(ap, fmt);
-    if (log_stderr_syslog_flag) {
-        now   = time(NULL);
-        nowtm = localtime(&now);
-        strftime(buff, sizeof(buff), "%Y-%m-%d %T", nowtm);
-        fprintf(stderr, "%s %d %s error: ", buff, getpid(), log_prog);
-    }
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    fflush(stderr);
+    return log_internal(stderr, "ERROR", format, &ap);
+
     va_end(ap);
 }
+
+
 

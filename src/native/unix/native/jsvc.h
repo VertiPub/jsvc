@@ -47,7 +47,6 @@ typedef enum {
 #include "signals.h"
 #include "locks.h"
 
-int  main(int argc, char *argv[]);
 void main_reload(void);
 void main_shutdown(void);
 

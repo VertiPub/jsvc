@@ -30,9 +30,15 @@ void help(home_data *data)
     printf("    -jvm <JVM name>\n");
     printf("        use a specific Java Virtual Machine. Available JVMs:\n");
     printf("           ");
-    for (x = 0; x < data->jnum; x++) {
-        printf(" '%s'", PRINT_NULL(data->jvms[x]->name));
+    
+    if (data) {
+        for (x = 0; x < data->jnum; x++) {
+            printf(" '%s'", PRINT_NULL(data->jvms[x]->name));
+        }
+    } else {
+        printf(" <not available>");
     }
+    
     printf("\n");
     printf("    -client\n");
     printf("        use a client Java Virtual Machine.\n");
@@ -99,7 +105,7 @@ void help(home_data *data)
     printf("    -keepstdin\n");
     printf("        does not redirect stdin to /dev/null\n");
     printf("\njsvc (Apache Commons Daemon) " JSVC_VERSION_STRING "\n");
-    printf("Copyright (c) 1999-2011 Apache Software Foundation.\n");
+    printf("Copyright (c) 1999-2012 Apache Software Foundation.\n");
 
     printf("\n");
 }

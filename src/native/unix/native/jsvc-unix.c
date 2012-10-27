@@ -40,6 +40,7 @@
 #include <time.h>
 #include <semaphore.h>
 #include <limits.h>
+#include <assert.h>
 
 /* This code does the following... 
  *
@@ -74,7 +75,7 @@
  */
 
 /* Try restarting a jvm no more than once every x seconds. */
-static time_t COOLDOWN_SEC = 60;
+static time_t COOLDOWN_SEC = 30;
 
 /* absolute path to cronolog file without extension myst be passed on the 
  * command line.   Examples:
@@ -87,10 +88,10 @@ static time_t COOLDOWN_SEC = 60;
  * symbolic link to the current file. 
  */
 static const char * const CRONO_FMT =
-        "cronolog -x %s-%%Y-%%m-%%d.log -S %s.log";
+        "cronolog -S %s.log %s-%%Y-%%m-%%d.log";
 
 /* If the JVM exits with exit code 123, the controller will recreate it. */
-static const int RELOAD_EXIT_CODE = 123;
+static const int RELOAD_CODE = 123;
 
 /* Max wait for stop */
 static const int STOP_TIMEOUT_SEC = 60;
@@ -98,10 +99,11 @@ static const int STOP_TIMEOUT_SEC = 60;
 /* The following variables are volatile and global to the compilation unit
  * because they are shared with signal handlers
  */
-static volatile int controller_is_running = 1;
 static volatile pid_t jvm_pid = -1;
 static volatile int reload_jvm = 0;
-static sem_t jvm_is_running;
+
+static sem_t controller_signal;
+static sem_t jvm_signal;
 
 static int controller_main(
         const arg_data *args,
@@ -114,7 +116,7 @@ static int jvm_main(
         const struct home_data *jvm_info,
         const struct passwd *user);
 
-static void controller_signal_handler(int signo);
+static void controller_signal_handler(int signo, siginfo_t *info, void *ctx);
 
 static int install_controller_signal_handler(void);
 
@@ -155,16 +157,6 @@ static int print_java_version(
         const arg_data *args,
         const struct home_data *jvm_info);
 
-static int linux_replace_process_image(
-        const arg_data *args,
-        const struct home_data *jvm_info,
-        int argc,
-        const char **argv);
-
-static const char *select_jvm(
-        const struct home_data *jvm_info,
-        const char *jvm_name);
-
 typedef enum {
     SUCCESS_EXIT = 0,
     ERROR_EXIT = 1,
@@ -181,6 +173,8 @@ static child_status wait_for_child(
         int *exit_code,
         int *signo,
         int wait_options);
+
+static int sem_wait_tolerate_eintr(sem_t *sem);
 
 int main(int argc, const char **argv) {
     arg_data *args = NULL;
@@ -235,14 +229,6 @@ int main(int argc, const char **argv) {
         return 1;
     }
 
-    /* TODO - maybe this is unnecessary now? remove? */
-
-    if (0 != linux_replace_process_image(args, jvm_info, argc, argv)) {
-        log_error("Cannot replace linux process image");
-
-        return 1;
-    }
-
     snprintf(sem_name, sizeof (sem_name) - 1, "jsvc_sem1_%d", getpid());
     sem_name[sizeof (sem_name) - 1] = 0;
 
@@ -284,9 +270,8 @@ int main(int argc, const char **argv) {
 
             /* Wait for the controller proc to signal it has detached */
 
-            if (0 != sem_wait(sem)) {
-                log_error("Cannot wait for controller process: %s",
-                        strerror(errno));
+            if (0 != sem_wait_tolerate_eintr(sem)) {
+                log_error("Cannot wait for controller process");
 
                 return -1;
             }
@@ -328,16 +313,16 @@ int controller_main(
     int first_time = 1;
     time_t last_jvm_start_sec = 0;
     time_t now = 0;
-    int exit_code = 0;
-    int signo = 0;
-    int wait_options = 0;
-    int result = -1;
+
+    if (0 != sem_init(&controller_signal, 0, 0)) {
+        log_error("Cannot initialize semaphore: %s", strerror(errno));
+
+        return 1;
+    }
 
     /* Install controller signal handlers.  */
 
     if (0 != install_controller_signal_handler()) {
-        delete_controller_pid_file(args);
-
         return -1;
     }
 
@@ -346,8 +331,6 @@ int controller_main(
      */
 
     if (0 != redirect_stdout_stderr(args, &crono_err, &crono_out)) {
-        delete_controller_pid_file(args);
-
         return -1;
     }
 
@@ -356,7 +339,7 @@ int controller_main(
      * process running at all times
      */
 
-    while (controller_is_running) {
+    while (1) {
 
         /* Start a new jvm process if no jvm process is currently running */
 
@@ -366,7 +349,11 @@ int controller_main(
             now = time(NULL);
 
             if (now - last_jvm_start_sec < COOLDOWN_SEC) {
-                sleep(COOLDOWN_SEC - (now - last_jvm_start_sec));
+                int wait = COOLDOWN_SEC - (now - last_jvm_start_sec);
+                
+                log_debug("Waiting for %d seconds before starting JVM", wait);
+                
+                sleep(wait);
 
                 last_jvm_start_sec = time(NULL);
             } else {
@@ -394,7 +381,7 @@ int controller_main(
 
         if (first_time) {
             /* First time through, write controller pid to an external pid file 
-             * and signal the original process that the controller has forked
+             * and tell the original process that the controller has forked
              * its first jvm.  This could be improved a bit - ideally we'd 
              * propogate any jvm start failure all the way back to the original
              * process/shell.
@@ -417,60 +404,23 @@ int controller_main(
             first_time = 0;
         }
 
-        /* Wait until the jvm dies or we're interrupted by a signal handler */
+        /* Wait until we catch a signal. */
 
-        result = wait_for_child("controller", "jvm", jvm_pid, &exit_code,
-                &signo, wait_options);
+        if (0 != sem_wait_tolerate_eintr(&controller_signal)) {
+            log_error("Controller cannot wait for signal");
 
-        if (SUCCESS_EXIT == result) {
-            log_debug("jvm exited successfully");
+            delete_controller_pid_file(args);
 
-            break;
+            return -1;
         }
 
-        if (ERROR_EXIT == result) {
-            if (RELOAD_EXIT_CODE == exit_code) {
-                log_debug("jvm reloading");
-
-                continue;
-            }
-
-            log_error("jvm exited with exit code: %d", exit_code);
-
-            break;
-        }
-
-        if (SIGNAL_EXIT == result) {
-            log_error("jvm killed by signal %d, restarting jvm", signo);
-
+        if (reload_jvm) {
             jvm_pid = -1;
 
             continue;
         }
 
-        if (INTERNAL_ERROR == result) {
-            /* This is arguable. */
-            log_error("Controller cannot wait on jvm, exiting");
-
-            break;
-        }
-
-        if (INTERRUPTED == result) {
-            /* signal handler was called while in wait_for_child.  Check to
-             * see if controller_is_running is still true, but do not start a
-             * new jvm process
-             */
-
-            continue;
-        }
-
-        if (CHILD_GONE == result) {
-            log_error("jvm no longer exists, restarting jvm");
-
-            jvm_pid = -1;
-
-            continue;
-        }
+        break;
     }
 
     log_debug("Controller shutdown initiated");
@@ -489,7 +439,7 @@ int jvm_main(
         const struct home_data *jvm_info,
         const struct passwd *user) {
 
-    if (0 != sem_init(&jvm_is_running, 0, 0)) {
+    if (0 != sem_init(&jvm_signal, 0, 0)) {
         log_error("Cannot initialize semaphore: %s", strerror(errno));
 
         return 1;
@@ -543,8 +493,8 @@ int jvm_main(
 
     log_debug("Daemon.start() succeeded");
 
-    if (0 != sem_wait(&jvm_is_running)) {
-        log_error("Cannot wait on jvm semaphore: %s", strerror(errno));
+    if (0 != sem_wait_tolerate_eintr(&jvm_signal)) {
+        log_error("JVM cannot wait for signal");
     }
 
     log_debug("Daemon shutting down");
@@ -750,144 +700,6 @@ int read_and_validate_user(const char *username, struct passwd *user) {
     return 0;
 }
 
-/* On some UNIX operating systems, we need to REPLACE this current
- * process image with another one (thru execve) to allow the correct
- * loading of VMs (notably this is for Linux). Set, replace, and go. 
- */
-int linux_replace_process_image(
-        const arg_data *args,
-        const struct home_data *jvm_info,
-        int argc,
-        const char **argv) {
-
-    /* TODO clean up this function - largey unmodified from jsvc original. */
-
-#ifdef OS_LINUX_TODO
-    char *oldpath = getenv("LD_LIBRARY_PATH");
-    char *libf = select_jvm(jvm_info, args->name);
-    char *filename;
-    char buf[2048];
-    int ret;
-    char *tmp = NULL;
-    char *p1 = NULL;
-    char *p2 = NULL;
-    char **argv2 = NULL;
-
-    if (strcmp(argv[0], args->procname) != 0) {
-        /*
-         * There is no need to change LD_LIBRARY_PATH
-         * if we were not able to find a path to libjvm.so
-         * (additionaly a strdup(NULL) cores dump on my machine).
-         */
-        if (libf != NULL) {
-            p1 = strdup(libf);
-            tmp = strrchr(p1, '/');
-            if (tmp != NULL)
-                tmp[0] = '\0';
-
-            p2 = strdup(p1);
-            tmp = strrchr(p2, '/');
-            if (tmp != NULL)
-                tmp[0] = '\0';
-
-            if (oldpath == NULL)
-                snprintf(buf, 2048, "%s:%s", p1, p2);
-            else
-                snprintf(buf, 2048, "%s:%s:%s", oldpath, p1, p2);
-
-            tmp = strdup(buf);
-            setenv("LD_LIBRARY_PATH", tmp, 1);
-
-            log_debug("Invoking w/ LD_LIBRARY_PATH=%s",
-                    getenv("LD_LIBRARY_PATH"));
-        }
-
-        /* execve needs a full path */
-        ret = readlink("/proc/self/exe", buf, sizeof (buf) - 1);
-        if (ret <= 0)
-            strcpy(buf, argv[0]);
-        else
-            buf[ret] = '\0';
-
-        filename = buf;
-
-        argv2 = (char **) malloc((argc + 1) * sizeof (char *));
-
-        if (!argv2) {
-            log_error("Cannot duplicate argv, out of memory");
-
-            return -1;
-        }
-
-        memcpy(argv2, argv, (argc + 1) * sizeof (char *));
-
-        argv2[0] = args->procname;
-
-        execve(filename, argv2, environ);
-
-        free(argv2);
-
-        log_error("Cannot execute JSVC executor process (%s): %s",
-                filename, strerror(errno));
-
-        return -1;
-    }
-
-    log_debug("Running w/ LD_LIBRARY_PATH=%s", getenv("LD_LIBRARY_PATH"));
-
-#endif /* ifdef OS_LINUX */    
-
-    return 0;
-}
-
-#ifdef OS_LINUX_TODO
-
-const char *select_jvm(const struct home_data *jvm_info, const char *jvm_name) {
-
-    const char *libf = NULL;
-    int i = 0;
-
-    /* Did we find ANY virtual machine? */
-
-    if (0 == jvm_info->jnum) {
-        log_error("Cannot find any VM in Java Home %s", jvm_info->path);
-
-        return NULL;
-    }
-
-    /* If the vm wasn't named, pick the first */
-
-    if (!jvm_name) {
-        libf = jvm_info->jvms[0]->libr;
-
-        log_debug("Using default JVM in %s", libf);
-
-        return libf;
-    }
-
-    /* else match the name */
-
-    for (i = 0; i < jvm_info->jnum; i++) {
-        if (!jvm_info->jvms[i]->name) {
-            continue;
-        }
-
-        if (0 == strcmp(jvm_name, jvm_info->jvms[i]->name)) {
-            libf = jvm_info->jvms[i]->libr;
-
-            log_debug("Using specific JVM in %s", libf);
-
-            return libf;
-        }
-    }
-
-    log_error("Invalid JVM name specified %s", jvm_name);
-
-    return NULL;
-}
-
-#endif
-
 /**
  * Redirect stderr and stdout to cronolog.   The caller must later call 
  * close_stdout_stderr on the two file handles or else cronolog will continue
@@ -1005,53 +817,64 @@ int redirect_stdout_stderr(
 }
 
 void close_stdout_stderr(FILE *crono_err, FILE *crono_out) {
-    if (crono_err) {
+    /* TODO - controller can block indefinitely on this.
+     * 
+     * if (crono_err) {
         pclose(crono_err);
     }
 
     if (crono_out && crono_out != crono_err) {
         pclose(crono_out);
-    }
+    }*/
 }
 
 int install_controller_signal_handler() {
-    if (SIG_ERR == signal(SIGHUP, controller_signal_handler)) {
+    struct sigaction action;
+
+    memset(&action, 0, sizeof (action));
+
+    action.sa_sigaction = controller_signal_handler;
+    action.sa_flags = SA_SIGINFO | SA_NOCLDSTOP | SA_NOCLDWAIT;
+
+
+    if (0 != sigaction(SIGHUP, &action, NULL)) {
         log_error("Cannot install controller SIGHUP handler: %s",
                 strerror(errno));
 
         return -1;
     }
 
-    if (SIG_ERR == signal(SIGUSR1, controller_signal_handler)) {
+    if (0 != sigaction(SIGUSR1, &action, NULL)) {
         log_error("Cannot install controller SIGUSR1 handler: %s",
                 strerror(errno));
 
         return -1;
     }
 
-    if (SIG_ERR == signal(SIGUSR2, controller_signal_handler)) {
+    if (0 != sigaction(SIGUSR2, &action, NULL)) {
         log_error("Cannot install controller SIGUSR2 handler: %s",
                 strerror(errno));
 
         return -1;
     }
 
-    if (SIG_ERR == signal(SIGTERM, controller_signal_handler)) {
+    if (0 != sigaction(SIGTERM, &action, NULL)) {
         log_error("Cannot install controller SIGTERM handler: %s",
                 strerror(errno));
 
         return -1;
     }
 
-    if (SIG_ERR == signal(SIGINT, controller_signal_handler)) {
+    if (0 != sigaction(SIGINT, &action, NULL)) {
         log_error("Cannot install controller SIGINT handler: %s",
                 strerror(errno));
 
         return -1;
     }
 
-    if (SIG_ERR == signal(SIGCHLD, SIG_IGN)) {
-        log_error("Cannot ignore SIGCHLD: %s", strerror(errno));
+    if (0 != sigaction(SIGCHLD, &action, NULL)) {
+        log_error("Cannot install controller SIGCHLD handler: %s",
+                strerror(errno));
 
         return -1;
     }
@@ -1131,7 +954,12 @@ int drop_privileges(const struct passwd *user) {
     return 0;
 }
 
-void controller_signal_handler(int signo) {
+void controller_signal_handler(int signo, siginfo_t *info, void *ctx) {
+
+    log_debug("Controller caught signal %d", signo);
+
+    fflush(stdout);
+
     switch (signo) {
         case SIGHUP:
 
@@ -1140,26 +968,94 @@ void controller_signal_handler(int signo) {
              */
 
             if (0 < jvm_pid) {
+                log_debug("Forwarding SIGHUP to JVM");
+
                 kill(jvm_pid, SIGHUP);
+            }
+
+            break;
+
+        case SIGCHLD:
+
+            /* Restart jvm killed by a signal or that exited with 123.
+             * Otherwise exit ourself.
+             */
+
+            if (jvm_pid == info->si_pid) {
+                switch (info->si_code) {
+                    case CLD_EXITED:
+
+                        if (RELOAD_CODE == info->si_status) {
+                            log_debug("Restarting JVM at JVM request");
+
+                            reload_jvm = 1;
+                        } else if (0 == info->si_status) {
+                            log_debug("JVM exited with %d, exiting controller",
+                                    info->si_status);
+
+                            reload_jvm = 0;
+                        } else {
+                            log_error("JVM exited with %d, exiting controller",
+                                    info->si_status);
+
+                            reload_jvm = 0;
+                        }
+
+                        jvm_pid = -1;
+
+                        sem_post(&controller_signal);
+
+                        break;
+
+                    case CLD_KILLED:
+                    case CLD_DUMPED:
+
+                        log_error("JVM killed by signal %d, restarting JVM",
+                                info->si_status);
+
+                        reload_jvm = 1;
+
+                        jvm_pid = -1;
+
+                        sem_post(&controller_signal);
+
+                        break;
+
+                    default:
+
+                        /* ignore*/
+
+                        break;
+                }
             }
 
             break;
 
         default:
 
-            /* For everthign else, forward the signal to the JVM process, then
+            /* For everthing else, forward the signal to the JVM process, then
              * start the shutdown sequence.
              */
 
             if (0 < jvm_pid) {
+                log_debug("Forwarding signal %d to JVM, exiting controller",
+                        signo);
+
                 kill(jvm_pid, signo);
             }
 
-            controller_is_running = 0;
+            reload_jvm = 0;
+
+            jvm_pid = -1;
+
+            sem_post(&controller_signal);
     }
 }
 
 void jvm_signal_handler(int signo) {
+
+    log_debug("JVM caught signal %d", signo);
+
     switch (signo) {
         case SIGHUP:
 
@@ -1169,7 +1065,7 @@ void jvm_signal_handler(int signo) {
 
         default:
 
-            sem_post(&jvm_is_running);
+            sem_post(&jvm_signal);
     }
 }
 
@@ -1246,13 +1142,13 @@ int write_controller_pid_file(const arg_data *args, pid_t controller_pid) {
     }
 
     while (bytes_written < bytes_to_write) {
-        result = read(
-                fd, 
-                buffer + bytes_written, 
+        result = write(
+                fd,
+                buffer + bytes_written,
                 bytes_to_write - bytes_written);
 
         if (0 > result) {
-            log_error("Cannot write pid %d to file %s: %s", 
+            log_error("Cannot write pid %d to file %s: %s",
                     controller_pid, args->pidf, strerror(errno));
 
             return -1;
@@ -1263,7 +1159,7 @@ int write_controller_pid_file(const arg_data *args, pid_t controller_pid) {
 
     close(fd);
     fd = -1;
-    
+
     log_debug("Wrote pid %d to file %s", controller_pid, args->pidf);
 
     return 0;
@@ -1368,17 +1264,40 @@ int print_java_version(const arg_data *args, const struct home_data *jvm_info) {
 
 void main_reload(void) {
     log_debug("JVM requested reload");
-    
+
     reload_jvm = 1;
-    
-    sem_post(&jvm_is_running);
+
+    sem_post(&jvm_signal);
 }
 
-void main_shutdown(void)
-{
+void main_shutdown(void) {
     log_debug("JVM requested shutdown");
-    
+
     reload_jvm = 0;
-    
-    sem_post(&jvm_is_running);
+
+    sem_post(&jvm_signal);
 }
+
+static int sem_wait_tolerate_eintr(sem_t *sem) {
+    int i;
+
+    for (i = 0; i < 100; ++i) {
+        if (0 != sem_wait(sem)) {
+            if (EINTR == errno) {
+                continue;
+            }
+
+            log_error("sem_wait failed: %s", strerror(errno));
+
+            return -1;
+        }
+
+        return 0;
+    }
+
+    log_error("sem_wait failed: too many interrupted system calls");
+
+    return -1;
+}
+
+

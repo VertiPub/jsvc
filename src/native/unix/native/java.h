@@ -20,15 +20,15 @@
 
 #define LOADER "org/apache/commons/daemon/support/DaemonLoader"
 
-char *java_library(arg_data *args, home_data *data);
-bool java_init(arg_data *args, home_data *data);
+char *java_library(const arg_data *args, const home_data *data);
+bool java_init(const arg_data *args, const home_data *data);
 bool java_destroy(void);
-bool java_load(arg_data *args);
+bool java_load(const arg_data *args);
 bool java_signal(void);
 bool java_start(void);
 bool java_stop(void);
 bool java_version(void);
-bool java_check(arg_data *args);
+bool java_check(const arg_data *args);
 bool JVM_destroy(int exit);
 
 #endif /* __JSVC_JAVA_H__ */

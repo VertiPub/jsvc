@@ -38,7 +38,7 @@ void log_internal(
         const char *format, 
         va_list *ap) {
     time_t now;
-    struct tm localtime;
+    struct tm gmtime;
     char buffer[513];
 
     if (NULL == format) {
@@ -48,13 +48,13 @@ void log_internal(
     buffer[sizeof (buffer) - 1] = 0;
 
     now = time(NULL);
-    localtime_r(&now, &localtime);
+    gmtime_r(&now, &gmtime);
 
     vsnprintf(buffer, sizeof (buffer) - 1, format, *ap);
 
     fprintf(file, "%d-%d-%d %d:%d:%d %s [%d] %s\n",
-            1900 + localtime.tm_year, localtime.tm_mon + 1, localtime.tm_mday,
-            localtime.tm_hour, localtime.tm_min, localtime.tm_sec,
+            1900 + gmtime.tm_year, gmtime.tm_mon + 1, gmtime.tm_mday,
+            gmtime.tm_hour, gmtime.tm_min, gmtime.tm_sec,
             level, getpid(), buffer);
 
     if (file == stdout) {

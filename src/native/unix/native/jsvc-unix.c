@@ -743,6 +743,12 @@ int redirect_stdout_stderr(
             return -1;
         }
 
+        /* turn off buffering.  stderr and stdout will do their own buffering
+         * as appropriate
+         */
+
+        setbuf(*crono_err, NULL);
+
         /* redirect the stderr file descriptor to cronolog's stdin */
 
         if (-1 == dup2(fileno(*crono_err), 2)) {
@@ -844,7 +850,7 @@ int install_controller_signal_handler() {
     action.sa_sigaction = controller_signal_handler;
     action.sa_flags = SA_SIGINFO | SA_NOCLDSTOP | SA_NOCLDWAIT;
 
-    for (i = 0; i < sizeof(signos) / sizeof(int); ++i) {
+    for (i = 0; i < sizeof (signos) / sizeof (int); ++i) {
         if (0 != sigaction(signos[i], &action, NULL)) {
             log_error("Cannot install controller signal %d handler: %s",
                     signos[i], strerror(errno));
@@ -866,7 +872,7 @@ int install_jvm_signal_handler() {
     action.sa_sigaction = jvm_signal_handler;
     action.sa_flags = SA_SIGINFO;
 
-    for (i = 0; i < sizeof(signos) / sizeof(int); ++i) {
+    for (i = 0; i < sizeof (signos) / sizeof (int); ++i) {
         if (0 != sigaction(signos[i], &action, NULL)) {
             log_error("Cannot install jvm signal %d handler: %s",
                     signos[i], strerror(errno));

@@ -53,7 +53,7 @@
  *    a. if detach is specified (defaults to true), runs the controller in a
  *       background process.   Otherwise controller_main() is called in the
  *       original process.
- *    b. writes it's own pid to an external pid file
+ *    b. writes its own pid to an external pid file
  *    c. installs signal handlers that will forward signals it catches to the
  *       jvm process
  *    d. the controller forks a new process for the jvm.  that process calls
@@ -77,7 +77,7 @@
 /* Try restarting a jvm no more than once every x seconds. */
 static time_t COOLDOWN_SEC = 30;
 
-/* absolute path to cronolog file without extension myst be passed on the 
+/* absolute path to cronolog file without extension must be passed on the 
  * command line.   Examples:
  * 
  * /var/log/mydaemon_stderr
@@ -122,7 +122,7 @@ static int install_controller_signal_handler(void);
 
 static int install_jvm_signal_handler(void);
 
-static void jvm_signal_handler(int signo);
+static void jvm_signal_handler(int signo, siginfo_t *info, void *ctx);
 
 typedef enum {
     SUCCESS = 0,
@@ -350,9 +350,9 @@ int controller_main(
 
             if (now - last_jvm_start_sec < COOLDOWN_SEC) {
                 int wait = COOLDOWN_SEC - (now - last_jvm_start_sec);
-                
+
                 log_debug("Waiting for %d seconds before starting JVM", wait);
-                
+
                 sleep(wait);
 
                 last_jvm_start_sec = time(NULL);
@@ -754,11 +754,19 @@ int redirect_stdout_stderr(
         if (-1 == dup2(fileno(*crono_err), 2)) {
             log_error("Cannot redirect stderr to cronlog: %s", strerror(errno));
 
+            if (0 != pclose(*crono_err)) {
+                log_error("Cannot close cronolog: %s", strerror(errno));
+            }
+
             return -1;
         }
 
         log_debug("Stderr redirected to %s", errfile);
     }
+
+    /* flush any data in stdout buffers before redirecting */
+
+    fflush(stdout);
 
     if (0 == strcmp(outfile, "/dev/null")) {
         if (NULL == freopen(outfile, "w", stdout)) {
@@ -807,6 +815,10 @@ int redirect_stdout_stderr(
         if (-1 == dup2(fileno(*crono_out), 1)) {
             log_error("Cannot redirect stdout to cronlog: %s", strerror(errno));
 
+            if (0 != pclose(*crono_err)) {
+                log_error("Cannot close cronolog: %s", strerror(errno));
+            }
+
             return -1;
         }
 
@@ -830,87 +842,44 @@ void close_stdout_stderr(FILE *crono_err, FILE *crono_out) {
 
 int install_controller_signal_handler() {
     struct sigaction action;
+    static const int signos[] = {SIGHUP, SIGUSR1, SIGUSR2, SIGTERM, SIGINT,
+        SIGCHLD};
+    int i;
 
     memset(&action, 0, sizeof (action));
 
     action.sa_sigaction = controller_signal_handler;
     action.sa_flags = SA_SIGINFO | SA_NOCLDSTOP | SA_NOCLDWAIT;
 
+    for (i = 0; i < sizeof (signos) / sizeof (int); ++i) {
+        if (0 != sigaction(signos[i], &action, NULL)) {
+            log_error("Cannot install controller signal %d handler: %s",
+                    signos[i], strerror(errno));
 
-    if (0 != sigaction(SIGHUP, &action, NULL)) {
-        log_error("Cannot install controller SIGHUP handler: %s",
-                strerror(errno));
-
-        return -1;
-    }
-
-    if (0 != sigaction(SIGUSR1, &action, NULL)) {
-        log_error("Cannot install controller SIGUSR1 handler: %s",
-                strerror(errno));
-
-        return -1;
-    }
-
-    if (0 != sigaction(SIGUSR2, &action, NULL)) {
-        log_error("Cannot install controller SIGUSR2 handler: %s",
-                strerror(errno));
-
-        return -1;
-    }
-
-    if (0 != sigaction(SIGTERM, &action, NULL)) {
-        log_error("Cannot install controller SIGTERM handler: %s",
-                strerror(errno));
-
-        return -1;
-    }
-
-    if (0 != sigaction(SIGINT, &action, NULL)) {
-        log_error("Cannot install controller SIGINT handler: %s",
-                strerror(errno));
-
-        return -1;
-    }
-
-    if (0 != sigaction(SIGCHLD, &action, NULL)) {
-        log_error("Cannot install controller SIGCHLD handler: %s",
-                strerror(errno));
-
-        return -1;
+            return -1;
+        }
     }
 
     return 0;
 }
 
 int install_jvm_signal_handler() {
-    if (SIG_ERR == signal(SIGHUP, jvm_signal_handler)) {
-        log_error("Cannot install jvm SIGHUP handler: %s", strerror(errno));
+    struct sigaction action;
+    static const int signos[] = {SIGHUP, SIGUSR1, SIGUSR2, SIGTERM, SIGINT};
+    int i;
 
-        return -1;
-    }
+    memset(&action, 0, sizeof (action));
 
-    if (SIG_ERR == signal(SIGUSR1, jvm_signal_handler)) {
-        log_error("Cannot install jvm SIGUSR1 handler: %s", strerror(errno));
+    action.sa_sigaction = jvm_signal_handler;
+    action.sa_flags = SA_SIGINFO;
 
-        return -1;
-    }
+    for (i = 0; i < sizeof (signos) / sizeof (int); ++i) {
+        if (0 != sigaction(signos[i], &action, NULL)) {
+            log_error("Cannot install jvm signal %d handler: %s",
+                    signos[i], strerror(errno));
 
-    if (SIG_ERR == signal(SIGUSR2, jvm_signal_handler)) {
-        log_error("Cannot install jvm SIGUSR2 handler: %s", strerror(errno));
-
-        return -1;
-    }
-
-    if (SIG_ERR == signal(SIGTERM, jvm_signal_handler)) {
-        log_error("Cannot install jvm SIGTERM handler: %s", strerror(errno));
-
-        return -1;
-    }
-
-    if (SIG_ERR == signal(SIGINT, jvm_signal_handler)) {
-        log_error("Cannot install jvm SIGINT handler: %s", strerror(errno));
-
-        return -1;
+            return -1;
+        }
     }
 
     if (SIG_ERR == signal(SIGPIPE, SIG_IGN)) {
@@ -1052,7 +1021,7 @@ void controller_signal_handler(int signo, siginfo_t *info, void *ctx) {
     }
 }
 
-void jvm_signal_handler(int signo) {
+void jvm_signal_handler(int signo, siginfo_t *info, void *ctx) {
 
     log_debug("JVM caught signal %d", signo);
 
@@ -1093,6 +1062,8 @@ read_pid_status read_controller_pid_file(
         if (0 > result) {
             log_error("Cannot read pid from file %s: %s", args->pidf,
                     strerror(errno));
+
+            close(fd);
 
             return ERROR;
         }
@@ -1150,6 +1121,8 @@ int write_controller_pid_file(const arg_data *args, pid_t controller_pid) {
         if (0 > result) {
             log_error("Cannot write pid %d to file %s: %s",
                     controller_pid, args->pidf, strerror(errno));
+
+            close(fd);
 
             return -1;
         }

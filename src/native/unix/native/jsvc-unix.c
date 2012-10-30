@@ -842,7 +842,8 @@ void close_stdout_stderr(FILE *crono_err, FILE *crono_out) {
 
 int install_controller_signal_handler() {
     struct sigaction action;
-    int signos[6] = {SIGHUP, SIGUSR1, SIGUSR2, SIGTERM, SIGINT, SIGCHLD};
+    static const int signos[] = {SIGHUP, SIGUSR1, SIGUSR2, SIGTERM, SIGINT,
+        SIGCHLD};
     int i;
 
     memset(&action, 0, sizeof (action));
@@ -864,7 +865,7 @@ int install_controller_signal_handler() {
 
 int install_jvm_signal_handler() {
     struct sigaction action;
-    int signos[5] = {SIGHUP, SIGUSR1, SIGUSR2, SIGTERM, SIGINT};
+    static int signos[] = {SIGHUP, SIGUSR1, SIGUSR2, SIGTERM, SIGINT};
     int i;
 
     memset(&action, 0, sizeof (action));

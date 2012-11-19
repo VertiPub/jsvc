@@ -942,7 +942,7 @@ int install_controller_signal_handler() {
 
 int install_jvm_signal_handler() {
     struct sigaction action;
-    static int signos[] = {SIGHUP, SIGUSR1, SIGUSR2, SIGTERM, SIGINT};
+    static const int signos[] = {SIGHUP, SIGUSR1, SIGUSR2, SIGTERM, SIGINT};
     int i;
 
     memset(&action, 0, sizeof (action));

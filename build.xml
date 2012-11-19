@@ -59,7 +59,7 @@
   <property name="component.title"         value="Java Daemons"/>
 
   <!-- The current version number of this component -->
-  <property name="component.version"       value="vc_0.1.0_1.0.10"/>
+  <property name="component.version"       value="vc_0.2.0_1.0.10"/>
 
   <!-- The base directory for compilation targets -->
   <property name="build.home"              value="target"/>

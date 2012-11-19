@@ -278,7 +278,7 @@ int main(int argc, const char **argv) {
             return -1;
         }
 
-        if (0 < controller_pid) {
+        if (0 == controller_pid) {
             /* In child/controller process */
 
             /* Create a new session with the controller process as its leader */

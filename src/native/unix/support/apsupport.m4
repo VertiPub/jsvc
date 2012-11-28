@@ -36,7 +36,7 @@ AC_DEFUN(AP_SUPPORTED_HOST,[
   linux*)
     CFLAGS="$CFLAGS -DOS_LINUX -DDSO_DLFCN"
     supported_os="linux"
-    LIBS="$LIBS -ldl -lpthread"
+    LIBS="$LIBS -ldl -lpthread -lrt"
     ;;
   cygwin)
     CFLAGS="$CFLAGS -DOS_CYGWIN -DDSO_DLFCN -DNO_SETSID"

@@ -200,7 +200,11 @@ typedef enum {
     SEM_TIMEDOUT = 2
 } sem_wait_status;
 
-/* Wait x seconds for the semaphore to be signalled. if 0 >= wait forever. */
+static int NUM_EXCESSIVE_EINTRS = 100;
+
+/* Wait x seconds for the semaphore to be signalled. if 0 >= wait forever.
+ * Retry up to NUM_EXCESSIVE_EINTRS interrupts before erroring out
+ */
 static sem_wait_status sem_wait_tolerate_eintr(sem_t *sem, int seconds);
 
 int main(int argc, const char **argv) {
@@ -209,6 +213,9 @@ int main(int argc, const char **argv) {
     struct home_data *jvm_info = NULL;
     pid_t controller_pid = 0;
     sem_t *sem = NULL;
+    char sem_name[NAME_MAX - 4]; /* NAME_MAX - 4 from manpage */
+
+    snprintf(sem_name, sizeof (sem_name) - 1, "jsvc_sem1_%d", getpid());
 
     memset(&user, 0, sizeof (user));
 
@@ -255,11 +262,7 @@ int main(int argc, const char **argv) {
     }
 
     if (args->dtch) {
-        char sem_name[NAME_MAX - 4]; /* NAME_MAX - 4 from manpage */
-
         log_debug("Detaching controller process");
-
-        snprintf(sem_name, sizeof (sem_name) - 1, "jsvc_sem1_%d", getpid());
 
         sem = sem_open(sem_name, O_CREAT, 0644, 0);
 
@@ -352,7 +355,7 @@ int main(int argc, const char **argv) {
              * not so we leave it to the operating system to reclaim.
              */
             
-            if (0 != sem_close(sem)) {
+            if (sem && 0 != sem_close(sem)) {
                 log_error("Cannot close controller semaphore: %s",
                         strerror(errno));
             }
@@ -375,6 +378,9 @@ int main(int argc, const char **argv) {
     controller_main(args, jvm_info, &user, &sem);
 
     /* This will never be called, controller_main will call exit() directly. */
+    
+    log_error("Unexpected, controller_main should have called exit()");
+    
     return 0;
 }
 
@@ -382,7 +388,7 @@ void controller_main(
         const arg_data *args,
         const struct home_data *jvm_info,
         const struct passwd *user,
-        sem_t **sem) {
+        sem_t **psem) {
     FILE *crono_err = NULL;
     FILE *crono_out = NULL;
     int first_time = 1;
@@ -468,8 +474,8 @@ void controller_main(
                 exit(5);
             }
 
-            if (*sem) {
-                if (0 != sem_post(*sem)) {
+            if (*psem) {
+                if (0 != sem_post(*psem)) {
                     log_error("Cannot signal main process: %s",
                             strerror(errno));
 
@@ -483,7 +489,7 @@ void controller_main(
                  * it stops waiting for this process to detach.
                  */
 
-                *sem = 0;
+                *psem = 0;
             }
 
             first_time = 0;
@@ -644,6 +650,10 @@ child_status wait_for_child(
                     log_debug("%s --wait--> %s:%d, interrupted by signal",
                             parent_name, child_name, child_pid);
 
+                    /* Automatically retry in case the waitpid() syscall is
+                     * interrupted by a signal.
+                     */
+                     
                     continue;
 
                 case ECHILD:
@@ -1316,7 +1326,17 @@ int print_java_version(const arg_data *args, const struct home_data *jvm_info) {
 }
 
 /* These two functions can be called from within the JVM to do an orderly
- * shutdown or reload
+ * shutdown or reload.
+ * 
+ * In Java, the Daemon.init() method will be passed a DaemonContext instance.
+ * DaemonContext has a getController() method which returns a DaemonController
+ * instance.   DaemonController exposes the following methods:
+ * 
+ * fail(...) -> prints error message + stack trace to daemon log,
+ *    then calls main_shutdown()
+ * shutdown() -> calls main_shutdown()
+ * reload() -> calls main_reload()
+ * 
  */
 
 void main_reload(void) {
@@ -1350,7 +1370,7 @@ sem_wait_status sem_wait_tolerate_eintr(sem_t *sem, int seconds) {
         abstime.tv_sec += seconds;
     }
 
-    for (i = 0; i < 100; ++i) {
+    for (i = 0; i < NUM_EXCESSIVE_EINTRS; ++i) {
         if (0 < seconds) {
             result = sem_timedwait(sem, &abstime);
         } else {

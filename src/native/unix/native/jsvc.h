@@ -48,7 +48,7 @@ typedef enum {
 #include "locks.h"
 
 void main_reload(void);
-void main_shutdown(void);
+void main_shutdown(int);
 
 #endif /* ifndef __JSVC_H__ */
 

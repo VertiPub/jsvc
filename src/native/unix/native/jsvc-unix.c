@@ -123,6 +123,11 @@ static volatile int shutdown_initiated = 0;
  */
 static volatile int jvm_reload = 0;
 
+/* If the Java program signalled failure by calling DaemonController.fail() 
+ * this will become non-zero and ultimately lead to a non-zero exit code.
+ */
+static volatile int jvm_failed = 0;
+
 
 static sem_t controller_signal; // initialized in controller_main()
 static sem_t jvm_signal; // initialized in jvm_main()
@@ -620,7 +625,7 @@ void jvm_main(
         exit(RELOAD_CODE);
     }
     
-    exit(0);
+    exit(jvm_failed);
 }
 
 child_status wait_for_child(
@@ -1333,8 +1338,8 @@ int print_java_version(const arg_data *args, const struct home_data *jvm_info) {
  * instance.   DaemonController exposes the following methods:
  * 
  * fail(...) -> prints error message + stack trace to daemon log,
- *    then calls main_shutdown()
- * shutdown() -> calls main_shutdown()
+ *    then calls main_shutdown(non-zero)
+ * shutdown() -> calls main_shutdown(zero)
  * reload() -> calls main_reload()
  * 
  */
@@ -1347,10 +1352,14 @@ void main_reload(void) {
     sem_post(&jvm_signal);
 }
 
-void main_shutdown(void) {
+void main_shutdown(int failed) {
     log_debug("JVM requested shutdown");
 
     jvm_reload = 0;
+    
+    if (failed) {
+        jvm_failed = 1;
+    }
 
     sem_post(&jvm_signal);
 }

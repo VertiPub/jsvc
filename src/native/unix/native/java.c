@@ -47,7 +47,7 @@ static void shutdown(JNIEnv *env, jobject source, jboolean reload)
     if (reload == TRUE)
         main_reload();
     else
-        main_shutdown();
+        main_shutdown(0);
 }
 
 static void failed(JNIEnv *env, jobject source, jstring message)
@@ -60,7 +60,7 @@ static void failed(JNIEnv *env, jobject source, jstring message)
     }
     else
         log_error("Failed requested");
-    main_shutdown();
+    main_shutdown(1);
 }
 
 /* Automatically restart when the JVM crashes */

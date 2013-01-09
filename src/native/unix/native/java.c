@@ -45,7 +45,7 @@ static void shutdown(JNIEnv *env, jobject source, jboolean reload)
 {
     log_debug("Shutdown requested (reload is %d)", reload);
     if (reload == TRUE)
-        main_reload();
+        main_shutdown(RELOAD_CODE);
     else
         main_shutdown(0);
 }

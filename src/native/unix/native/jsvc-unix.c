@@ -90,9 +90,6 @@ static time_t COOLDOWN_SEC = 30;
 static const char * const CRONO_FMT =
         "cronolog -S %s.log %s-%%Y-%%m-%%d.log";
 
-/* If the JVM exits with exit code 123, the controller will recreate it. */
-static const int RELOAD_CODE = 123;
-
 /* Max wait for stop */
 static const int STOP_TIMEOUT_SEC = 60;
 
@@ -113,15 +110,10 @@ static volatile pid_t jvm_pid = -1;
  */
 static volatile int shutdown_initiated = 0;
 
-/* Specific to the JVM process
- *
- * If non-zero the JVM will request the controller process restart it.  This
- * occurs either if the Java code running on the JVM exits with code 123 or 
- * if a SIGHUP is sent to either the JVM process or, more likely, the
- * controller process (the controller forwards any SIGHUP it catches to the
- * JVM process and waits for the JVM process to tell it to reload).
+/* The exit code for the JVM.  If non-zero the daemon controller will restart
+ * it automatically unless the daemon controller has been told to stop.
  */
-static volatile int jvm_reload = 0;
+static volatile int jvm_exit_code = 0;
 
 
 static sem_t controller_signal; // initialized in controller_main()
@@ -207,7 +199,8 @@ static int NUM_EXCESSIVE_EINTRS = 100;
  */
 static sem_wait_status sem_wait_tolerate_eintr(sem_t *sem, int seconds);
 
-int main(int argc, const char **argv) {
+int main(int argc, const char **argv)
+{
     arg_data *args = NULL;
     struct passwd user;
     struct home_data *jvm_info = NULL;
@@ -291,62 +284,62 @@ int main(int argc, const char **argv) {
 
                 return -1;
             }
-            
+
             /* Then call controller_main() below */
 
         } else {
             /* In parent/original process */
 
             /* Wait 5 sec for the controller proc to signal it has detached */
-            
+
             if (SEM_SUCCESS != sem_wait_tolerate_eintr(sem, 5)) {
                 int exit_code = 0;
                 int signo = 0;
-                
+
                 log_error("Cannot wait for controller process");
-                
+
                 switch (wait_for_child("main", "controller", controller_pid,
                         &exit_code, &signo, WNOHANG)) {
-                    case SUCCESS_EXIT:
-                    case ERROR_EXIT:
-                        
-                        log_error("Controller exited prematurely with code %d",
-                                exit_code);
-                        
-                        return -1;
+                case SUCCESS_EXIT:
+                case ERROR_EXIT:
 
-                    case SIGNAL_EXIT:
+                    log_error("Controller exited prematurely with code %d",
+                            exit_code);
 
-                        log_error("Controller killed by signal %d", signo);
+                    return -1;
 
-                        return -1;
+                case SIGNAL_EXIT:
 
-                    case INTERNAL_ERROR:
+                    log_error("Controller killed by signal %d", signo);
 
-                        log_error("Cannot determine controller status");
+                    return -1;
 
-                        kill(controller_pid, SIGTERM);
+                case INTERNAL_ERROR:
 
-                        return -1;
+                    log_error("Cannot determine controller status");
 
-                    case CHILD_GONE:
+                    kill(controller_pid, SIGTERM);
 
-                        log_error("Controller never created");
+                    return -1;
 
-                        return -1;
+                case CHILD_GONE:
 
-                    case CHILD_ALIVE:
+                    log_error("Controller never created");
 
-                        log_error("Controller is jammed");
+                    return -1;
 
-                        kill(controller_pid, SIGTERM);
+                case CHILD_ALIVE:
 
-                        return -1;
+                    log_error("Controller is jammed");
 
-                    default:
-                        
-                        return -1;
-                }          
+                    kill(controller_pid, SIGTERM);
+
+                    return -1;
+
+                default:
+
+                    return -1;
+                }
             }
 
             /* Once the controller has signalled the semaphore it's done.  If
@@ -354,12 +347,12 @@ int main(int argc, const char **argv) {
              * we don't know if the controller has signalled the semaphore or
              * not so we leave it to the operating system to reclaim.
              */
-            
+
             if (sem && 0 != sem_close(sem)) {
                 log_error("Cannot close controller semaphore: %s",
                         strerror(errno));
             }
-            
+
             sem = 0;
 
             /* controller has detached */
@@ -378,9 +371,9 @@ int main(int argc, const char **argv) {
     controller_main(args, jvm_info, &user, &sem);
 
     /* This will never be called, controller_main will call exit() directly. */
-    
+
     log_error("Unexpected, controller_main should have called exit()");
-    
+
     return 0;
 }
 
@@ -388,7 +381,8 @@ void controller_main(
         const arg_data *args,
         const struct home_data *jvm_info,
         const struct passwd *user,
-        sem_t **psem) {
+        sem_t **psem)
+{
     FILE *crono_err = NULL;
     FILE *crono_out = NULL;
     int first_time = 1;
@@ -508,7 +502,7 @@ void controller_main(
         if (shutdown_initiated) {
             break;
         }
-        
+
         /* Restart the JVM unless it exited 0 or shutdown was initiated
          * by the controller.
          */
@@ -524,7 +518,8 @@ void controller_main(
 void jvm_main(
         const arg_data *args,
         const struct home_data *jvm_info,
-        const struct passwd *user) {
+        const struct passwd *user)
+{
 
     if (0 != sem_init(&jvm_signal, 0, 0)) {
         log_error("Cannot initialize semaphore: %s", strerror(errno));
@@ -608,19 +603,18 @@ void jvm_main(
 
     /* Destroy the JVM itself */
 
-    if (true != JVM_destroy(jvm_reload ? RELOAD_CODE : 0)) {
+    if (true != JVM_destroy(jvm_exit_code)) {
         log_error("JVM destroy failed");
 
         exit(9);
     }
-
-    log_debug("Daemon successfully shut down");
-
-    if (jvm_reload) {
-        exit(RELOAD_CODE);
-    }
     
-    exit(0);
+    /* This will not be reached unless JVM_destroy fails to invoke System.exit()
+     */
+
+    log_debug("Daemon shut down");
+
+    exit(jvm_exit_code);
 }
 
 child_status wait_for_child(
@@ -629,7 +623,8 @@ child_status wait_for_child(
         pid_t child_pid,
         int *exit_code,
         int *signo,
-        int wait_options) {
+        int wait_options)
+{
     int status = 0;
     pid_t result = -1;
 
@@ -638,37 +633,37 @@ child_status wait_for_child(
 
     while (1) {
         result = waitpid(child_pid, &status, wait_options);
-        
+
         if (0 == result && (WNOHANG & wait_options)) {
             return CHILD_ALIVE;
         }
 
         if (-1 == result) {
             switch (errno) {
-                case EINTR:
+            case EINTR:
 
-                    log_debug("%s --wait--> %s:%d, interrupted by signal",
-                            parent_name, child_name, child_pid);
+                log_debug("%s --wait--> %s:%d, interrupted by signal",
+                        parent_name, child_name, child_pid);
 
-                    /* Automatically retry in case the waitpid() syscall is
-                     * interrupted by a signal.
-                     */
-                     
-                    continue;
+                /* Automatically retry in case the waitpid() syscall is
+                 * interrupted by a signal.
+                 */
 
-                case ECHILD:
+                continue;
 
-                    log_debug("%s --wait--> %s:%d, child no longer exists",
-                            parent_name, child_name, child_pid);
+            case ECHILD:
 
-                    return CHILD_GONE;
+                log_debug("%s --wait--> %s:%d, child no longer exists",
+                        parent_name, child_name, child_pid);
 
-                default:
+                return CHILD_GONE;
 
-                    log_error("%s --wait--> %s:%d, error=%s",
-                            parent_name, child_name, child_pid, strerror(errno));
+            default:
 
-                    return INTERNAL_ERROR;
+                log_error("%s --wait--> %s:%d, error=%s",
+                        parent_name, child_name, child_pid, strerror(errno));
+
+                return INTERNAL_ERROR;
             }
         }
 
@@ -677,13 +672,13 @@ child_status wait_for_child(
 
             if (0 == *exit_code) {
                 log_debug("%s --wait--> %s:%d, %s exited=%d",
-                    parent_name, child_name, child_pid, child_name, *exit_code);
-                
+                        parent_name, child_name, child_pid, child_name, *exit_code);
+
                 return SUCCESS_EXIT;
             } else {
                 log_error("%s --wait--> %s:%d, %s exited=%d",
-                    parent_name, child_name, child_pid, child_name, *exit_code);
-                
+                        parent_name, child_name, child_pid, child_name, *exit_code);
+
                 return ERROR_EXIT;
             }
         }
@@ -718,7 +713,8 @@ child_status wait_for_child(
     }
 }
 
-int read_and_validate_user(const char *username, struct passwd *user) {
+int read_and_validate_user(const char *username, struct passwd *user)
+{
     struct passwd *result = NULL;
     char *buffer = NULL;
     int buffer_size = 0;
@@ -817,7 +813,8 @@ int read_and_validate_user(const char *username, struct passwd *user) {
 int redirect_stdout_stderr(
         const arg_data *args,
         FILE **crono_err,
-        FILE **crono_out) {
+        FILE **crono_out)
+{
     const char *outfile = args->outfile;
     const char *errfile = args->errfile;
 
@@ -927,7 +924,8 @@ int redirect_stdout_stderr(
     return 0;
 }
 
-int install_controller_signal_handler() {
+int install_controller_signal_handler()
+{
     struct sigaction action;
     static const int signos[] = {SIGHUP, SIGUSR1, SIGUSR2, SIGTERM, SIGINT,
         SIGCHLD};
@@ -950,7 +948,8 @@ int install_controller_signal_handler() {
     return 0;
 }
 
-int install_jvm_signal_handler() {
+int install_jvm_signal_handler()
+{
     struct sigaction action;
     static const int signos[] = {SIGHUP, SIGUSR1, SIGUSR2, SIGTERM, SIGINT};
     int i;
@@ -978,7 +977,8 @@ int install_jvm_signal_handler() {
     return 0;
 }
 
-int drop_privileges(const struct passwd *user) {
+int drop_privileges(const struct passwd *user)
+{
     if (NULL == user) {
         log_debug("Not dropping privs");
 
@@ -1010,131 +1010,134 @@ int drop_privileges(const struct passwd *user) {
     return 0;
 }
 
-void controller_signal_handler(int signo, siginfo_t *info, void *ctx) {
+void controller_signal_handler(int signo, siginfo_t *info, void *ctx)
+{
 
     log_debug("Controller caught signal %d", signo);
 
     fflush(stdout);
 
     switch (signo) {
-        case SIGHUP:
+    case SIGHUP:
 
-            /* Forward the SIGHUP to the JVM process.  It should exit 123 
-             * which will inform this controller process to restart it.
-             */
+        /* Forward the SIGHUP to the JVM process.  It should exit 123 
+         * which will inform this controller process to restart it.
+         */
 
-            if (0 < jvm_pid) {
-                log_debug("Forwarding SIGHUP to JVM");
+        if (0 < jvm_pid) {
+            log_debug("Forwarding SIGHUP to JVM");
 
-                kill(jvm_pid, SIGHUP);
-            }
+            kill(jvm_pid, SIGHUP);
+        }
 
-            break;
+        break;
 
-        case SIGCHLD:
+    case SIGCHLD:
 
-            /* Restart jvm killed by a signal or that exited with 123.
-             * Otherwise exit ourself.
-             */
+        /* Restart jvm killed by a signal or that exited with 123.
+         * Otherwise exit ourself.
+         */
 
-            if (jvm_pid == info->si_pid) {
-                switch (info->si_code) {
-                    case CLD_TRAPPED:
-                    case CLD_STOPPED:
-                    case CLD_CONTINUED:
-                        
-                        /* ignore */
-                        
-                        break;
-                        
-                    case CLD_EXITED:
+        if (jvm_pid == info->si_pid) {
+            switch (info->si_code) {
+            case CLD_TRAPPED:
+            case CLD_STOPPED:
+            case CLD_CONTINUED:
 
-                        if (RELOAD_CODE == info->si_status) {
-                            log_debug("Restarting JVM at JVM request");
-                        } else if (0 == info->si_status) {
-                            log_debug("JVM exited with %d, exiting controller",
-                                    info->si_status);
+                /* ignore */
 
-                            shutdown_initiated = 1;
-                        } else {
-                            log_error("JVM exited with %d, restarting jvm",
-                                    info->si_status);
-                        }
+                break;
 
-                        jvm_pid = -1;
+            case CLD_EXITED:
 
-                        sem_post(&controller_signal);
+                if (RELOAD_CODE == info->si_status) {
+                    log_debug("Restarting JVM at JVM request");
+                } else if (0 == info->si_status) {
+                    log_debug("JVM exited with %d, exiting controller",
+                            info->si_status);
 
-                        break;
-
-                    case CLD_KILLED:
-                    case CLD_DUMPED:
-
-                        log_error("JVM killed by signal %d, restarting JVM",
-                                info->si_status);
-
-                        jvm_pid = -1;
-
-                        sem_post(&controller_signal);
-
-                        break;
-
-                    default:
-
-                        log_error("JVM signaled for an unknown reason, exiting "
-                                "controller");
-
-                        shutdown_initiated = 1;
-
-                        jvm_pid = -1;
-
-                        sem_post(&controller_signal);
+                    shutdown_initiated = 1;
+                } else {
+                    log_error("JVM exited with %d, restarting jvm",
+                            info->si_status);
                 }
+
+                jvm_pid = -1;
+
+                sem_post(&controller_signal);
+
+                break;
+
+            case CLD_KILLED:
+            case CLD_DUMPED:
+
+                log_error("JVM killed by signal %d, restarting JVM",
+                        info->si_status);
+
+                jvm_pid = -1;
+
+                sem_post(&controller_signal);
+
+                break;
+
+            default:
+
+                log_error("JVM signaled for an unknown reason, exiting "
+                        "controller");
+
+                shutdown_initiated = 1;
+
+                jvm_pid = -1;
+
+                sem_post(&controller_signal);
             }
+        }
 
-            break;
+        break;
 
-        default:
+    default:
 
-            /* For everthing else, forward the signal to the JVM process, then
-             * start the shutdown sequence.
-             */
+        /* For everthing else, forward the signal to the JVM process, then
+         * start the shutdown sequence.
+         */
 
-            if (0 < jvm_pid) {
-                log_debug("Forwarding signal %d to JVM, exiting controller",
-                        signo);
+        if (0 < jvm_pid) {
+            log_debug("Forwarding signal %d to JVM, exiting controller",
+                    signo);
 
-                kill(jvm_pid, signo);
-            }
+            kill(jvm_pid, signo);
+        }
 
-            shutdown_initiated = 1;
+        shutdown_initiated = 1;
 
-            jvm_pid = -1;
+        jvm_pid = -1;
 
-            sem_post(&controller_signal);
+        sem_post(&controller_signal);
     }
 }
 
-void jvm_signal_handler(int signo, siginfo_t *info, void *ctx) {
+void jvm_signal_handler(int signo, siginfo_t *info, void *ctx)
+{
 
     log_debug("JVM caught signal %d", signo);
 
     switch (signo) {
-        case SIGHUP:
+    case SIGHUP:
 
-            jvm_reload = 1;
+        jvm_exit_code = RELOAD_CODE;
 
-            /* fall through */
+        /* fall through */
 
-        default:
+    default:
 
-            sem_post(&jvm_signal);
+        sem_post(&jvm_signal);
     }
 }
 
 read_pid_status read_controller_pid_file(
         const arg_data *args,
-        pid_t *controller_pid) {
+        pid_t *controller_pid)
+{
     int fd = -1;
     int bytes_read = 0;
     ssize_t result = 0;
@@ -1185,7 +1188,8 @@ read_pid_status read_controller_pid_file(
     return READ_SUCCESS;
 }
 
-int write_controller_pid_file(const arg_data *args, pid_t controller_pid) {
+int write_controller_pid_file(const arg_data *args, pid_t controller_pid)
+{
     char buffer[80];
     int bytes_written = 0;
     int bytes_to_write = 0;
@@ -1230,7 +1234,8 @@ int write_controller_pid_file(const arg_data *args, pid_t controller_pid) {
     return 0;
 }
 
-int delete_controller_pid_file(const arg_data *args) {
+int delete_controller_pid_file(const arg_data *args)
+{
     if (0 != unlink(args->pidf)) {
         if (ENOENT == errno) {
             log_debug("Controller pid file %s already deleted", args->pidf);
@@ -1249,30 +1254,31 @@ int delete_controller_pid_file(const arg_data *args) {
     return 0;
 }
 
-int stop_controller(const arg_data *args) {
+int stop_controller(const arg_data *args)
+{
     pid_t pid = -1;
     int i = 0;
 
     switch (read_controller_pid_file(args, &pid)) {
-        case READ_NO_FILE:
+    case READ_NO_FILE:
 
-            log_debug("Pid file %s doesn't exist, assuming controller dead",
-                    args->pidf);
+        log_debug("Pid file %s doesn't exist, assuming controller dead",
+                args->pidf);
 
-            return 0;
+        return 0;
 
-        case READ_ERROR:
+    case READ_ERROR:
 
-            log_error("Cannot stop controller, cannot read pid file %s",
-                    args->pidf);
+        log_error("Cannot stop controller, cannot read pid file %s",
+                args->pidf);
 
-            return -1;
+        return -1;
 
-        default:
+    default:
 
-            /* successfully read controller pid */
+        /* successfully read controller pid */
 
-            break;
+        break;
     }
 
     /* kill the process and wait until the pidfile has been
@@ -1285,7 +1291,7 @@ int stop_controller(const arg_data *args) {
 
         return -1;
     }
-    
+
     sleep(0); /* yield to the process we are killing */
 
     for (i = 0; i < STOP_TIMEOUT_SEC; ++i) {
@@ -1294,7 +1300,7 @@ int stop_controller(const arg_data *args) {
 
             return 0;
         }
-        
+
         sleep(1);
     }
 
@@ -1304,7 +1310,8 @@ int stop_controller(const arg_data *args) {
     return -1;
 }
 
-int print_java_version(const arg_data *args, const struct home_data *jvm_info) {
+int print_java_version(const arg_data *args, const struct home_data *jvm_info)
+{
     bool result = false;
 
     if (true != java_init(args, jvm_info)) {
@@ -1325,7 +1332,7 @@ int print_java_version(const arg_data *args, const struct home_data *jvm_info) {
     return result ? 0 : -1;
 }
 
-/* These two functions can be called from within the JVM to do an orderly
+/* This function can be called from within the JVM to do an orderly
  * shutdown or reload.
  * 
  * In Java, the Daemon.init() method will be passed a DaemonContext instance.
@@ -1333,29 +1340,32 @@ int print_java_version(const arg_data *args, const struct home_data *jvm_info) {
  * instance.   DaemonController exposes the following methods:
  * 
  * fail(...) -> prints error message + stack trace to daemon log,
- *    then calls main_shutdown()
- * shutdown() -> calls main_shutdown()
- * reload() -> calls main_reload()
+ *    then calls main_shutdown(non-zero)
+ * shutdown() -> calls main_shutdown(zero)
+ * reload() -> calls main_shutdown(123)
  * 
  */
 
-void main_reload(void) {
-    log_debug("JVM requested reload");
+void main_shutdown(int exit_code)
+{
+    jvm_exit_code = exit_code;
 
-    jvm_reload = 1;
+    switch (exit_code) {
+    case RELOAD_CODE:
+        log_debug("JVM requested reload");
+        break;
+    case 0:
+        log_debug("JVM requested shutdown");
+        break;
+    default:
+        log_error("JVM requested restart due to error");
+    }
 
     sem_post(&jvm_signal);
 }
 
-void main_shutdown(void) {
-    log_debug("JVM requested shutdown");
-
-    jvm_reload = 0;
-
-    sem_post(&jvm_signal);
-}
-
-sem_wait_status sem_wait_tolerate_eintr(sem_t *sem, int seconds) {
+sem_wait_status sem_wait_tolerate_eintr(sem_t *sem, int seconds)
+{
     int i;
     int result;
     struct timespec abstime;

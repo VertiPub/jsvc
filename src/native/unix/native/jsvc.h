@@ -47,8 +47,10 @@ typedef enum {
 #include "signals.h"
 #include "locks.h"
 
-void main_reload(void);
-void main_shutdown(void);
+/* If the JVM exits with exit code 123, the controller will recreate it. */
+#define RELOAD_CODE 123
+
+void main_shutdown(int);
 
 #endif /* ifndef __JSVC_H__ */
 

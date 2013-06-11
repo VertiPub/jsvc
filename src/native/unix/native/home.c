@@ -99,11 +99,13 @@ static bool parse(home_data *data)
                 k = replace(temp, 1024, orig, "$JAVA_HOME", data->path);
                 if (k != 0) {
                     log_error("Can't replace home in VM library (%d)", k);
+                    fclose(cfgf);
                     return (false);
                 }
                 k = replace(repl, 1024, temp, "$VM_NAME", ret);
                 if (k != 0) {
                     log_error("Can't replace name in VM library (%d)", k);
+                    fclose(cfgf);
                     return (false);
                 }
 
@@ -127,6 +129,7 @@ static bool parse(home_data *data)
             }
         }
     }
+    fclose(cfgf);
     return (true);
 }
 

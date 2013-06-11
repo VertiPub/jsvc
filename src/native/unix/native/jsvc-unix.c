@@ -389,12 +389,6 @@ void controller_main(
     time_t last_jvm_start_sec = 0;
     time_t now = 0;
 
-    if (0 != sem_init(&controller_signal, 0, 0)) {
-        log_error("Cannot initialize semaphore: %s", strerror(errno));
-
-        exit(1);
-    }
-
     /* Install controller signal handlers.  */
 
     if (0 != install_controller_signal_handler()) {
@@ -407,6 +401,12 @@ void controller_main(
 
     if (0 != redirect_stdout_stderr(args, &crono_err, &crono_out)) {
         exit(3);
+    }
+
+    if (0 != sem_init(&controller_signal, 0, 0)) {
+        log_error("Cannot initialize semaphore: %s", strerror(errno));
+
+        exit(1);
     }
 
     /* Until the controller is instructed to exit or a jvm process exits 
@@ -818,15 +818,21 @@ int redirect_stdout_stderr(
     const char *outfile = args->outfile;
     const char *errfile = args->errfile;
 
-    /* unconditionally close stdin, we don't need it. */
+    /* Close stdin/err/out first so we don't hang remote shells */
 
     fclose(stdin);
 
+    fflush(stdout);
+
+    close(1);
+    close(2);
+
+    /* The remote shell should return at exactly this point.  Now we enter
+     * the time where if anything goes wrong we can't log it.
+     */
+
     if (0 == strcmp(errfile, "/dev/null")) {
         if (NULL == freopen(errfile, "w", stderr)) {
-            log_error("Cannot redirect stderr to /dev/null: %s",
-                    strerror(errno));
-
             return -1;
         }
     } else {
@@ -838,9 +844,6 @@ int redirect_stdout_stderr(
         *crono_err = popen(cmd, "w");
 
         if (!*crono_err) {
-            log_error("Cannot open cronolog for stderr: file=%s, err=%s",
-                    errfile, strerror(errno));
-
             return -1;
         }
 
@@ -853,21 +856,13 @@ int redirect_stdout_stderr(
         /* redirect the stderr file descriptor to cronolog's stdin */
 
         if (-1 == dup2(fileno(*crono_err), 2)) {
-            log_error("Cannot redirect stderr to cronlog: %s", strerror(errno));
-
-            if (0 != pclose(*crono_err)) {
-                log_error("Cannot close cronolog: %s", strerror(errno));
-            }
+            pclose(*crono_err);
 
             return -1;
         }
-
-        log_debug("Stderr redirected to %s", errfile);
     }
 
-    /* flush any data in stdout buffers before redirecting */
-
-    fflush(stdout);
+    /* Now we can log errors again */
 
     if (0 == strcmp(outfile, "/dev/null")) {
         if (NULL == freopen(outfile, "w", stdout)) {
@@ -917,9 +912,10 @@ int redirect_stdout_stderr(
 
             return -1;
         }
-
-        log_debug("stdout redirected to %s", outfile);
     }
+
+    log_debug("Stderr redirected to %s", errfile);
+    log_debug("stdout redirected to %s", outfile);
 
     return 0;
 }

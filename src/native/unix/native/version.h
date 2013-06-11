@@ -47,7 +47,7 @@
 
 /** The formatted string of APU's version */
 #define JSVC_VERSION_STRING \
-     "vc_0.3.2_" \
+     "vc_0.3.3_" \
      JSVC_STRINGIFY(JSVC_MAJOR_VERSION) "."   \
      JSVC_STRINGIFY(JSVC_MINOR_VERSION) "."   \
      JSVC_STRINGIFY(JSVC_PATCH_VERSION)       \

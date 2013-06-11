@@ -1348,8 +1348,6 @@ int print_java_version(const arg_data *args, const struct home_data *jvm_info)
 
 void main_shutdown(int exit_code)
 {
-    log_debug("JVM requested shutdown");
-
     jvm_exit_code = exit_code;
 
     switch (exit_code) {

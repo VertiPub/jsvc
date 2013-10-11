@@ -1102,10 +1102,10 @@ void controller_signal_handler(int signo, siginfo_t *info, void *ctx)
                     signo);
 
             kill(jvm_pid, signo);
+            waitpid(jvm_pid, NULL, 0);
         }
 
         shutdown_initiated = 1;
-
         jvm_pid = -1;
 
         sem_post(&controller_signal);

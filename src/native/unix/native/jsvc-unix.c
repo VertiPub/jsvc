@@ -537,14 +537,6 @@ void jvm_main(
 
     log_debug("Initialized JVM");
 
-    /* Install signal handlers */
-
-    if (0 != install_jvm_signal_handler()) {
-        log_error("Cannot install jvm signal handler");
-
-        exit(3);
-    }
-
     /* Call org.apache.commons.daemon.support.DaemonLoader.load() via JNI.
      * This will ultimately call org.apache.commons.daemon.Daemon.init()
      */
@@ -574,6 +566,21 @@ void jvm_main(
     }
 
     log_debug("Daemon.start() succeeded");
+    
+    /* Install signal handlers.   Installing these relatively late because
+     * the original jsvc installed the signal handlers after java_start().  
+     * The result is that some applications (e.g., Hadoop Datanode) never
+     * return from their Daemon.start() impl, but their developers never 
+     * realized there was an issue because the default signal handler would 
+     * terminate the process rather than initiate an orderly shutdown.  To
+     * do the right thing at this point would break backwards compatability.
+     */
+
+    if (0 != install_jvm_signal_handler()) {
+        log_error("Cannot install jvm signal handler");
+
+        exit(3);
+    }
 
     if (0 != sem_wait_tolerate_eintr(&jvm_signal, 0)) {
         log_error("JVM cannot wait for signal");
